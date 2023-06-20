@@ -1,0 +1,476 @@
+---
+title: "2Code for plotting Figure 2"
+author: "Amy Tresenrider"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+
+suppressPackageStartupMessages({ 
+  library(tidyverse)
+  library(ggplot2)
+  library(tidyr)
+  library(viridis)
+  library(ggridges)
+  library(purrr)
+  library(monocle3)
+  library(RColorBrewer)
+  library(dplyr)
+  library(dirmult)
+  library(Seurat)
+  library(cowplot)
+  library(vioplot)
+  library(ggrepel)
+  library(VGAM)
+  library(ggpubr)
+  library(sigminer)
+  
+  
+  # Pass TRUE if you want to see progress output on some of Monocle 3's operations
+  DelayedArray:::set_verbose_block_processing(TRUE)
+  # Passing a higher value will make some computations faster but use more memory. 
+  # Adjust with caution!
+  options(DelayedArray.block.size=1000e6)
+  # Set a seed to make umap and other non-deterministic steps consistent
+  #set.seed(seed = 42)
+  
+  # load colors
+  treat_colors = read.csv("treatment_colors.csv", 
+                         header = F, sep = ",")
+  colors = read.csv("organoid_colors_young.csv", header = F)
+
+})
+```
+
+# preparation
+```{r load data}
+
+cds = readRDS("GSM6808632_cds_d28_annotated_220708.RDS220708.RDS")
+
+```
+
+```{r sort out the organoids with too few cells}
+
+# get counts of cells in each cell type
+hash_df = cds@colData %>% as.data.frame() %>%
+  group_by(top_oligo, cell_type, treatment) %>%
+  dplyr::count()
+
+# get total cells per oligo
+total_cells  = hash_df %>% ungroup(cell_type) %>% dplyr::summarise(total_cells = sum(n)) %>% select(-treatment)
+
+merge_hash_df = left_join(hash_df, total_cells, by = "top_oligo")
+merge_hash_df = merge_hash_df %>% mutate(pct_ct = n/total_cells) %>% filter(total_cells > 50)
+
+# get the remaining top oligos
+include_oligos = merge_hash_df %>% pull(top_oligo)
+cds = cds[, cds@colData$top_oligo %in% include_oligos]
+
+```
+
+# Figure 2C
+```{r count the number of cells per organoid}
+
+coldata_df = cds@colData %>% as.data.frame()
+
+to_count_df = coldata_df %>%
+  group_by(treatment, top_oligo) %>%
+  summarize(n = n()) 
+to_count_df %>% summarise(median = median(n))
+
+summ = to_count_df %>%
+  summarize(n = n())
+max = to_count_df %>%
+  summarize(max = max(n))
+min = to_count_df %>%
+  ungroup() %>%
+  summarise(mean = median(n)) 
+
+count_violin = coldata_df %>%
+  filter(top_oligo %in% to_count_df$top_oligo) %>%
+  group_by(top_oligo, treatment) %>%
+  dplyr::count() %>%
+  ggplot(aes(x = factor(treatment, levels = c("None", "SAG", 
+                                              "BMP", "CHIR", 
+                                              "SU5402", "SU5402:CHIR", 
+                                              "All")), 
+                        y = n, fill = treatment)) +
+  geom_boxplot(notch = T) +
+  geom_text(data = summ,
+    aes(label = n, y = 100 + max$max),
+    position = position_dodge(0.9),
+    vjust = 0) +
+  monocle3:::monocle_theme_opts() +
+  scale_fill_manual(values = treat_colors$V3, limits = treat_colors$V1) +
+  theme(axis.text.x = element_text(),
+        axis.title.x = element_blank(),
+        legend.position = "none") +
+  ylab("Cells per organoid") 
+save_plot("Plots/violin_cells_per_organoid.jpeg", count_violin, 
+          base_height = 2.5, base_width = 5.5)
+
+```
+
+# Figure 2D
+```{r dot plots of genes used for annotation}
+
+margin_spacer <- function(x) {
+  # where x is the column in your dataset
+  left_length <- nchar(levels(factor(x)))[1]
+  if (left_length > 8) {
+    return((left_length - 8) * 4)
+  }
+  else
+    return(0)
+}
+
+# as cell_type as factor with specified order/levels
+cds$cell_type = factor(cds$cell_type, 
+                       levels = c("RPC_OV","Lens", "RPE", "Retina",
+                                  "Neuron_nonretinal", "OS",
+                                  "Telencephalon","Diencephalon",
+                                  "RP", "Hindbrain", "FP", "Cornea"))
+dp1 = plot_genes_by_group(cds,
+                    c("RAX", "VSX2",  # retinal progenitor
+                      "PROX1", "CRYBB1", # lens
+                      "TYRP1", "TYR", "TRPM1", # RPE
+                      "RORB", "ATOH7", "ONECUT2", "HES6", # retina
+                      "ELAVL4", "MYT1L",  # differentiating neuron
+                      "VAX1", "PAX2", # optic stalk
+                      "SOX1", "FOXG1", "NKX2-1",  # telencephalon
+                      "NKX2-2", "FOXD1", # diencephalon
+                      "GDF7", "TTR", "LMX1A", # roof plate
+                      "HOXC4", "HOXD3", "HOXB6", #hindbrain
+                      "FOXA2", "SHH", #floor plate
+                      "DCN", "LUM" # cornea
+                      ), 
+                    group_cells_by="cell_type",
+                    ordering_type="none",
+                    max.size=8,
+                    norm_method = "log",
+                    lower_threshold = 0.0001,
+                    scale_max = 0.5,
+                    axis_order = "marker_group") +
+  scale_color_gradient(low = "#fbce65", high = "#D63D1F") +
+  theme(axis.title = element_blank(),
+        text = element_text(size = 12),
+        plot.margin = margin(l = 0 + margin_spacer(cds$cell_type)),
+        legend.position = "bottom")
+save_plot(dp1, filename = "Plots/dot_plot_genes.jpeg", base_height = 4, base_width = 11)
+
+```
+
+# Figure 2E
+```{r UMAP color by cell type}
+
+# make UMAP coordinates a column in colData
+cds$UMAP1 = reducedDim(cds, type = "UMAP")[,1]
+cds$UMAP2 = reducedDim(cds, type = "UMAP")[,2]
+
+gg1 = plot_cells(cds, color_cells_by = "cell_type", cell_size = 0.1,
+                label_cell_groups = F, x = 1, y = 2) +
+  scale_color_manual(limits = colors$V5, values = colors$V6) +
+  theme_void() + theme(legend.position = "none",
+                       panel.background = element_rect(color = "NA", 
+                                                       fill = "white"),
+                       plot.background = element_rect(fill = "white", 
+                                                      colour = "NA"))
+save_plot(filename = "Plots/hashed_umap.jpeg", gg1, base_height = 3, base_width = 3)
+
+```
+
+```{r UMAPs colored by treatment}
+
+treatments = unique(cds$treatment)
+for (i in treatments) {
+  gg2 = plot_cells(cds, color_cells_by = "treatment", cell_size = 0.1,
+                label_cell_groups = F, x = 1, y = 2) +
+    scale_color_manual(limits = colors_treat$V1, values = colors_treat$V3) +
+    gghighlight(treatment == i) +
+    theme_void() + monocle3:::monocle_theme_opts()
+save_plot(gg2, filename = paste0("Plots/umap_", i, ".jpeg"), base_height = 3, base_width = 3)
+}
+
+```
+
+# Figure 2F
+```{r plot stacked barplots}
+
+treat_df = cds@colData %>% as.data.frame() %>%
+  group_by(treatment, cell_type) %>%
+  dplyr::count()
+gg = ggplot(treat_df, aes(fill=factor(cell_type, 
+                                      levels = c("RPC_OV", "Retina", "RPE", 
+                                                 "Lens", "Neuron_nonretinal", 
+                                                 "OS", "Telencephalon",
+                                                 "Diencephalon", "RP", "FP",
+                                                 "Hindbrain", "Cornea")), 
+                          y=n, 
+                          x=factor(treatment, levels = c("None", "SAG", "BMP",
+                                                         "SU5402", "CHIR",
+                                                         "SU5402:CHIR", "All")))) +
+    geom_bar(position="fill", stat="identity") +
+    ylab("% Cell Type") +
+    monocle3:::monocle_theme_opts() +
+    scale_fill_discrete(name = "Cell Type") +
+    scale_fill_manual(values = colors$V6, limits = colors$V5) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0))) +
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 30, vjust = 1, hjust = 1),
+          axis.title.x = element_blank())
+save_plot(paste0("Plots/barplot_treatments_cell_type.jpeg"), gg, 
+          base_height = 4, base_width = 2.5)
+
+```
+
+# Figure 2G
+```{r function to get the size factored normalized cell count data}
+
+cell_count_df = function(data, treatments) {
+  
+  coldata_df = data[data$treatment %in% treatments, ]
+  cds_summary = coldata_df %>%
+    group_by(top_oligo, cell_type) %>%
+    dplyr::summarize(cells = n())
+  
+  cell_counts_wide = tidyr::spread(cds_summary, cell_type, cells, fill=0)
+  top_oligo = as.character(cell_counts_wide %>% pull("top_oligo"))
+  cell_counts_wide = as.matrix(cell_counts_wide[,2:ncol(cell_counts_wide)])
+  row.names(cell_counts_wide) = top_oligo
+  cell_counts_wide = t(cell_counts_wide) # cell types x top_oligo
+  
+  # can filter by total count in well
+  cell_counts_wide = cell_counts_wide[,colSums(cell_counts_wide) > 50] 
+  coldata_df = coldata_df %>% filter(top_oligo %in% colnames(cell_counts_wide))
+  
+  # account for size factors 
+  covariates_df = coldata_df %>% dplyr::select(top_oligo, plate, treatment) %>%
+    distinct() %>% as.data.frame %>% 
+    arrange(top_oligo)
+  rownames(covariates_df) = covariates_df$top_oligo
+  cell_count_cds = new_cell_data_set(expression_data = cell_counts_wide,
+                                     cell_metadata = covariates_df[colnames(cell_counts_wide), ])
+  cds_summary$size_factor = size_factors(cell_count_cds)[cds_summary$top_oligo]
+  cds_summary = cds_summary %>% mutate(cells= round(cells/size_factor)) 
+    
+  celltype_df = cds_summary %>% 
+    ungroup() %>% 
+    group_by(top_oligo) %>% 
+    mutate(total_cells = sum(cells)) %>% 
+    ungroup() %>%
+    mutate(cell_type = as.factor(cell_type)) %>%
+    pivot_wider(names_from = cell_type, values_from = cells, values_fill = list(cells = 0)) 
+  
+  # get unique cell types
+  cell_types = coldata_df %>% pull(cell_type) %>% unique()
+  celltype_df = celltype_df %>% inner_join(covariates_df)
+
+}
+
+```
+
+```{r, violin plot for individual cell types and selected molecules}
+
+coldata_df = colData(cds) %>% as.data.frame()
+treatments = unique(coldata_df$treatment)
+celltype_df = cell_count_df(data = coldata_df, treatments)
+
+ # reorganize for violin plots later
+celltype_gather = celltype_df %>%
+  gather(key = cell_type, 
+         value = cells, -c(top_oligo, size_factor, total_cells, treatment))
+
+
+# choose what to plot
+cell_types = unique(celltype_gather$cell_type)
+
+for (ct in cell_types) {
+    # plot 
+    gg1 = celltype_gather %>% 
+      filter(cell_type == ct) %>%
+      ggplot(aes(x=factor(treatment, 
+                          levels = c("None", "SAG", "All", "BMP", 
+                                     "CHIR", "SU5402", "SU5402:CHIR")), 
+                 y=as.numeric(cells),
+                 fill = treatment)) + 
+      geom_violin(scale = "width", lwd = 0.2) +
+      geom_quasirandom(size = 0.1, alpha = 0.4) +
+      scale_fill_manual(limits = treat_colors$V1, values = treat_colors$V3) +
+      expand_limits(y = 0) +
+      monocle3:::monocle_theme_opts() +
+      ylab("Normalized cell count") + labs(title = ct) +
+      theme(legend.position = "none",
+            text = element_text(size = 12),
+            plot.title = element_text(hjust = 0.5),
+            axis.title.x = element_blank(),
+            axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+            panel.spacing = unit(1.2, "lines")) 
+    save_plot(paste0("Plots/violin_BMP_vs_", ct, "_treatment-color.jpeg"), gg1, 
+              base_width = 2.5, base_height = 3)
+
+}
+
+```
+
+## load data for unfiltered plots
+```{r load data}
+
+# can be made from the GEO uploaded metadata and matrix
+all_cds = readRDS("organoid/new211028_young-organoids_cds_with_hash_data.RDS")
+
+```
+
+# Figure S2A-D
+```{r qc plots}
+
+# S1A RNA knee plot
+breaks_for_plot_x = c(1, 10, 100, 1000, 10000, 100000)
+breaks_for_plot_y = c(1, 10, 30, 100, 300, 1000, 3000, 10000, 100000)
+
+# RNA knee plot
+p = all_cds@colData %>% as.data.frame() %>%
+  dplyr::select(cell, n.umi) %>%
+  arrange(desc(n.umi)) %>%
+  mutate(rank = dplyr::row_number()) %>%
+  ggplot() +
+  geom_line(aes(x = rank,
+                y = n.umi)) +
+  scale_x_log10(breaks = breaks_for_plot_x) +
+  scale_y_log10(breaks = breaks_for_plot_y) +
+  theme_classic() +
+  geom_hline(yintercept = 100, 
+             color = "red") +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1)) + 
+  xlab("Number of cells") +
+  ylab("RNA UMIs")
+
+# S2B histogram of mito reads
+p4 = umi_cds@colData %>% as.data.frame() %>%
+  dplyr::select(cell, perc_mitochondrial_umis) %>%
+  ggplot() +
+  geom_histogram(aes(perc_mitochondrial_umis), bins = 50) +
+  scale_x_continuous(expand = c(0, 0), limits = c(0, 40)) + 
+  scale_y_continuous(expand = c(0,0)) +
+  monocle3:::monocle_theme_opts() +
+  xlab("% Mitochondrial UMIs") +
+  ylab("Cell Count") +
+  geom_vline(xintercept = 15, col = "red")
+mito_cds = umi_cds[, umi_cds@colData$perc_mitochondrial_umis < 15]
+
+# S2C top ratio histogram
+p2 = mito_cds@colData %>% as.data.frame() %>%
+  dplyr::select(cell, top_to_second_best_ratio) %>%
+  ggplot() +
+  geom_histogram(aes(log2(top_to_second_best_ratio)), bins = 200) +
+  scale_x_continuous(limits = c(0,12), expand = c(0, 0)) + 
+  scale_y_continuous(expand = c(0, 0)) +
+  monocle3:::monocle_theme_opts() +
+  xlab("Top to second best ratio (log2)") + ylab("Cell Count") +
+  geom_vline(xintercept = log2(3), col = "red")
+
+# top ratio bar plot
+p3 = mito_cds@colData %>% as.data.frame() %>%
+  mutate(hash_info = case_when(top_to_second_best_ratio <= 3 ~ "<= 3",
+                               (top_to_second_best_ratio > 3 & top_to_second_best_ratio < Inf) ~ "> 3",
+                               top_to_second_best_ratio == Inf ~ "infinite",
+                               is.na(top_to_second_best_ratio) ~ " no hash")) %>%
+  group_by(hash_info) %>%
+  dplyr::count() %>%
+  ggplot(aes(x = hash_info, y = n)) +
+  geom_bar(stat = "identity") +
+  monocle3:::monocle_theme_opts() +
+  scale_y_continuous(expand = c(0, 0)) +
+  xlab("Top to second best ratio") + ylab("Cell Count")
+
+pg = plot_grid(p, p4, p2, p3, rel_widths = c(1, 1, 1.25, 1), nrow = 1)
+save_plot("Plots/hash_combined.jpeg", pg, base_height = 3, base_width = 15)
+
+```
+
+# Figure S2E
+```{r plot n.umi per organoid per treatment}
+
+numi_boxplot = cds@colData %>% as.data.frame() %>%
+  group_by(treatment, top_oligo) %>%
+  summarize(median = median(n.umi)) %>%
+  ggplot(aes(x = factor(treatment, levels = c("None", "SAG", "BMP", "CHIR", "SU5402", "SU5402:CHIR", "All")), 
+                        y = median, fill = treatment)) +
+  geom_violin() +
+  geom_boxplot(width = 0.1) +
+  scale_y_continuous(limits = c(0, 600)) +
+  monocle3:::monocle_theme_opts() +
+  scale_fill_manual(values = treat_colors$V3, limits = treat_colors$V1) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        axis.title.x = element_blank(),
+        legend.position = "none",
+        text = element_text(size = 18)) +
+  ylab("Median UMIs per Cell per Organoid (log2)") 
+
+numi_boxplot
+save_plot("Plots/bp_umis_per_organoid.jpeg", numi_boxplot, base_height = 6, base_width = 5)
+
+```
+
+# Figure S2F
+```{r make the plots for the number of genes/features per organoid}
+
+cds = detect_genes(cds) 
+
+nfeature_boxplot = cds@colData %>% as.data.frame() %>%
+  group_by(treatment, top_oligo) %>%
+  summarize(median = median(num_genes_expressed)) %>%
+  ggplot(aes(x = factor(treatment, levels = c("None", "SAG", "BMP", "CHIR", "SU5402", "SU5402:CHIR", "All")), 
+                        y = median, fill = treatment)) +
+  geom_violin() +
+  geom_boxplot(width=0.1) +
+  scale_y_continuous(limits = c(0, 500)) +
+  monocle3:::monocle_theme_opts() +
+  scale_fill_manual(values = treat_colors$V3, limits = treat_colors$V1) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        axis.title.x = element_blank(),
+        legend.position = "none",
+        text = element_text(size = 18)) +
+  ylab("Median features per Cell per Organoid") 
+
+nfeature_boxplot
+
+save_plot("Plots/bp_features_per_organoid.jpeg", nfeature_boxplot, base_height = 6, base_width = 5)
+
+```
+
+# Figure S2H
+```{r feature plots}
+
+genes = c("RAX", "VSX2", # retinal progenitor
+                      "PROX1", "CRYBB1", # lens
+                      "TYRP1", "TYR", "TRPM1", # RPE
+                      "RORB", "ATOH7", "HES6", # retina
+                      "ELAVL4", "MYT1L",  # differentiating neuron
+                      "VAX1", "PAX2", # optic stalk
+                      "SOX1", "FOXG1", "NKX2-1",  # telencephalon
+                      "NKX2-2", "FOXD1", # diencephalon
+                      "GDF7", "LMX1A", # roof plate
+                      "HOXC4", "HOXD3", #hindbrain
+                      "FOXA2", "SHH", #floor plate
+                      "DCN", "LUM" # cornea
+                      ) # other 3
+p = plot_cells(cds, genes = genes, 
+               cell_size = 0.1, label_cell_groups = F,
+               scale_to_range = T) + 
+  theme_void() + monocle3:::monocle_theme_opts() +
+  theme(panel.background = element_rect(color = "black", fill = "white"),
+        plot.background = element_rect(fill = "white", colour = "NA"),
+        legend.position = "bottom")
+save_plot("Plots/all_cell_feature_umap.jpeg", p, base_height = 8, base_width = 10.5)
+
+```
+
+
+
+
+
+
+
+

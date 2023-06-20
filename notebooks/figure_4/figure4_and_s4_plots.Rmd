@@ -1,0 +1,1371 @@
+---
+title: "Code for plotting Figure 4"
+author: "Amy Tresenrider"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+
+suppressPackageStartupMessages({ 
+  library(tidyverse)
+  library(ggplot2)
+  library(tidyr)
+  library(viridis)
+  library(ggridges)
+  library(purrr)
+  library(monocle3)
+  library(RColorBrewer)
+  library(dplyr)
+  library(dirmult)
+  library(Seurat)
+  library(cowplot)
+  library(vioplot)
+  library(ggrepel)
+  library(VGAM)
+  library(ggpubr)
+  library(sigminer)
+  library(ggpmisc)
+  library(rstatix)
+  library(data.table)
+  library(devtools)
+  library(stringr)
+  library(reshape2)
+  library(VGAM)
+  library(glasso)
+  library(gprofiler2)
+  library(reshape2)
+  library(uwot)
+  library(gghighlight)
+  library(pheatmap)
+  library(DelayedArray)
+  
+  
+  # Pass TRUE if you want to see progress output on some of Monocle 3's operations
+  DelayedArray:::set_verbose_block_processing(TRUE)
+  # Passing a higher value will make some computations faster but use more memory. 
+  # Adjust with caution!
+  options(DelayedArray.block.size=1000e6)
+  # Set a seed to make umap and other non-deterministic steps consistent
+  set.seed(seed = 42)
+  
+  # load colors
+  treat_colors = read.csv("treatment_colors.csv", 
+                         header = F, sep = ",")
+  colors = read.csv("organoid_colors_new.csv", header = F)
+
+})
+```
+
+# preparation
+```{r load data}
+
+cds = readRDS("GSM6808633_cds_d63_annotated_221128.RDS")
+
+```
+
+# Figure 4A
+```{r}
+
+# make UMAP coordinates a column in colData
+cds$UMAP1 = reducedDim(cds, type = "UMAP")[,1]
+cds$UMAP2 = reducedDim(cds, type = "UMAP")[,2]
+
+gg1 = plot_cells(cds, color_cells_by = "cell_type", cell_size = 0.1,
+                label_cell_groups = F, x = 1, y = 2) +
+  scale_color_manual(limits = colors$V1, values = colors$V2) +
+  theme_void() + theme(legend.position = "none",
+                       panel.background = element_rect(fill = "white", colour = "NA"))
+save_plot(filename = "Plots/hashed_cell_umap.jpeg", gg1, base_height = 3, base_width = 3)
+
+```
+
+# code to setup the beta binomial analysis for Figures 4B-C and Figure 4I
+## get into a table of cell counts
+```{r}
+
+coldata_df = colData(cds) %>% as.data.frame()
+cds_summary = coldata_df %>%
+  group_by(top_oligo, cell_type) %>%
+  dplyr::summarize(cells = n())
+
+cell_counts_wide = tidyr::spread(cds_summary, cell_type, cells, fill=0)
+top_oligo = as.character(cell_counts_wide %>% pull("top_oligo"))
+cell_counts_wide = as.matrix(cell_counts_wide[,2:ncol(cell_counts_wide)])
+row.names(cell_counts_wide) = top_oligo
+cell_counts_wide = t(cell_counts_wide) # cell types x top_oligo
+
+# can filter by total count in well
+cell_counts_wide = cell_counts_wide[,colSums(cell_counts_wide) > 50] 
+coldata_df = coldata_df %>% filter(top_oligo %in% colnames(cell_counts_wide))
+
+# account for size factors 
+covariates_df = coldata_df %>% dplyr::select(top_oligo, plate, treatment) %>%
+  distinct() %>% as.data.frame %>% 
+  arrange(top_oligo)
+rownames(covariates_df) = covariates_df$top_oligo
+cell_count_cds = new_cell_data_set(expression_data = cell_counts_wide,
+                                   cell_metadata = covariates_df[colnames(cell_counts_wide), ])
+cds_summary$size_factor = size_factors(cell_count_cds)[cds_summary$top_oligo]
+cds_summary = cds_summary %>% mutate(cells= round(cells/size_factor)) 
+  
+celltype_df = cds_summary %>% 
+  ungroup() %>% 
+  group_by(top_oligo) %>% 
+  mutate(total_cells = sum(cells)) %>% 
+  ungroup() %>%
+  mutate(cell_type = as.factor(cell_type)) %>%
+  pivot_wider(names_from = cell_type, values_from = cells, 
+              values_fill = list(cells = 0)) 
+
+# get unique cell types
+cell_types = coldata_df %>% pull(cell_type) %>% unique()
+celltype_df = celltype_df %>% inner_join(covariates_df)
+
+ # reorganize for boxplots
+celltype_gather = celltype_df %>%
+  gather(key = cell_type, 
+         value = cells, -c(top_oligo, size_factor, total_cells, treatment))
+
+```
+
+# perform beta-binomial testing
+```{r, bb help functions}
+
+# a help function to tidy the vgam model output - used in compare_abundance function
+tidy.vglm = function(x, conf.int=FALSE, conf.level=0.95) {
+  co <- as.data.frame(coef(summary(x)))
+  names(co) <- c("estimate","std.error","statistic","p.value")
+  if (conf.int) {
+    qq <- qnorm((1+conf.level)/2)
+    co <- transform(co,
+                    conf.low=estimate-qq*std.error,
+                    conf.high=estimate+qq*std.error)
+  }
+  co <- data.frame(term=rownames(co),co)
+  rownames(co) <- NULL
+  return(co)
+}
+
+# function that uses beta binomial regression to compare the abundances of a celltype from two conditions
+compare_abundance = function(cell_df, wt_df, model_formula = "count_df ~ treatment", ...){
+  comb_df = rbind(as.data.frame(cell_df), as.data.frame(wt_df)) %>% 
+    mutate(treatment = fct_relevel(treatment, c(unique(wt_df$treatment))))
+  
+  print(unique(comb_df$treatment))
+  cell.types = unique(comb_df$cell_type)
+  
+  test_res = sapply(cell.types, 
+                    FUN = function(x) {
+                      type_df = comb_df %>% filter(cell_type == x)
+                      count_df = cbind(type_df$cells, type_df$total_cells - type_df$cells)
+                      print(head(type_df))
+                      fit = vglm(as.formula(model_formula), betabinomial, 
+                                 data = type_df, trace = TRUE, ...)
+                      fit_df = tidy.vglm(fit)}, USE.NAMES = T, simplify = F)
+  
+  test_res = do.call(rbind, test_res)
+  test_res = test_res %>% tibble::rownames_to_column(var = "cell_group")
+  test_res %>% arrange(desc(estimate))
+}
+
+```
+
+```{r, compute fold changes}
+
+# filter treatment and control groups
+treatments <- unique(celltype_df$treatment)
+ctrl_groups <- grep("^BMP$", treatments, value = TRUE, )
+test_groups <- grep("^BMP$", treatments, invert = TRUE, value = TRUE)
+
+
+# pivot the celltype_df
+mean_thresh = 1 # threshold for mean number of cells per top_oligo 
+all_summary = celltype_df %>% 
+  pivot_longer(cols = c("RPC", "RPCprolif", "RPCproneural",
+                        "Npre", "RGCpre", "RGC", "HApre", "PBpre",
+                        "ONHprog", "CN",
+                        "Undefined", "RG", "CP",  
+                        "RPE"
+                        ), 
+               names_to = "cell_type", values_to = "cells")
+
+# control summary table
+control_df = all_summary %>%
+    filter(treatment == "BMP") %>%
+    group_by(treatment, cell_type) %>% 
+    dplyr::summarize(ctrl_mean = round(mean(cells))) %>% 
+    ungroup() %>% 
+    distinct(cell_type, ctrl_mean)
+  
+# perturbation summary table
+fc_df = all_summary %>%
+    filter(treatment != "BMP") %>% 
+    group_by(treatment, cell_type) %>% 
+    dplyr::summarize(mol_mean = round(mean(cells))) %>% 
+    left_join(control_df, by = "cell_type") %>% 
+    mutate(abund_log2fc = log2((mol_mean + 1)/(ctrl_mean+1)))
+  
+fc_df
+
+```
+
+```{r, run BB testing across cell types and treatments}
+
+# calculate the cell_type_means
+celltype_means = all_summary %>% 
+    group_by(cell_type) %>%
+    dplyr::summarize(mol_mean = round(mean(cells))) %>%
+    ungroup()
+
+# filter cell groups
+cell.groups = all_summary %>%
+  group_by(cell_type) %>% 
+  dplyr::summarize(mol_mean = mean(cells)) %>%
+  ungroup() %>% 
+  filter(mol_mean > mean_thresh) %>% 
+  pull(cell_type)
+cell.groups <- as.character(cell.groups)
+
+
+# filter for control groups only
+control_filt = all_summary %>%
+  dplyr::filter(treatment == "BMP") %>%
+  dplyr::filter(cell_type %in% cell.groups)
+  
+# filter for perturbation groups only
+treat_filt = all_summary %>%
+  filter(!treatment == "BMP") %>%
+  dplyr::filter(cell_type %in% cell.groups)
+
+# compare
+celltype_diff = compare_abundance(treat_filt, control_filt, 
+                                  model_formula = "count_df ~ treatment") %>% 
+    filter(!(grepl("intercept", term, ignore.case = T))) %>% 
+    dplyr::mutate(qval = p.adjust(p.value, method = "BH")) %>% 
+    mutate(treat.v.control = stringr::str_sub(term, 10)) %>% 
+    separate(cell_group, into = c("cell_group", NULL), sep = "\\.") %>%
+    dplyr::select(treat.v.control, everything(), -term) %>%
+    arrange(treat.v.control) %>% 
+    left_join(celltype_means %>% 
+              dplyr::rename(cell_group = cell_type), by = c("cell_group")) %>%
+    left_join(fc_df %>% 
+                dplyr::select(treat.v.control = treatment, cell_group = cell_type, abund_log2fc),
+              by = c("treat.v.control", "cell_group"))
+  
+celltype_diff = celltype_diff %>%
+  arrange(p.value)
+
+# save results
+fwrite(celltype_diff, "Tables/211028-drugtreatments_bb_res.csv", sep = ",", na = "NA")
+
+```
+
+# Figure 4B
+```{r, heatmap outlining sig all cell types}
+
+qval_thresh = 0.05
+sig_df = celltype_diff %>% 
+  ungroup() %>% 
+  dplyr::mutate(sig_fc = case_when(qval < qval_thresh ~ TRUE, 
+                                   TRUE ~ FALSE))
+# summarize counts
+hm_wide = sig_df %>%  
+  dplyr::select(treat.v.control, cell_group, abund_log2fc) %>%
+  pivot_wider(names_from = cell_group,
+              values_from = abund_log2fc, values_fill = c(0))
+hm_plot = hm_wide %>% 
+  pivot_longer(!treat.v.control, names_to = "cell_group", values_to = "plot") %>%
+  left_join(sig_df %>% 
+              dplyr::select(treat.v.control, cell_group, sig_fc), 
+            by = c("treat.v.control", "cell_group"), ) %>%
+  mutate(sig_fc = replace_na(sig_fc, FALSE), 
+         treatment = treat.v.control,
+         cell_group = as.factor(cell_group))
+
+new_levels = c("SU5402:CHIR", "CHIR")
+hm_plot$treatment = factor(hm_plot$treatment, levels = new_levels)
+
+# get clustering results
+hm_wider = hm_wide %>% 
+  mutate(treatment = treat.v.control) %>% 
+  dplyr::select(treatment, everything(), -treat.v.control)
+hm_mat <- as.matrix(hm_wider[, -1])
+rownames(hm_mat) <- hm_wider$treatment
+hm_mat <- t(hm_mat)
+hm.dendro <- as.dendrogram(hclust(d = dist(x = hm_mat)))
+hm.order <- order.dendrogram(hm.dendro)
+
+# reorder cell type factor
+hm_plot$cell_group <- factor(as.character(hm_plot$cell_group),
+                             rownames(hm_mat[hm.order,]))
+
+# plot heatmap
+p = hm_plot %>%
+  ggplot(aes(y = treatment,
+             x = cell_group,
+             fill = plot)) + 
+  geom_tile() +
+  scale_fill_gradient2(low = "#009FB8", mid = "white", high= "#D65108", 
+                       na.value="black", name="" ) +
+  geom_point(hm_plot %>% filter(sig_fc == TRUE),
+               mapping = aes(x = as.factor(cell_group), y = as.factor(treatment)), 
+               shape = 8, size = 0.5) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.title.y = element_blank(), text = element_text(size = 10),
+        axis.title.x = element_blank(),
+        plot.title = element_text(hjust = 0.75), 
+        axis.line = element_line(colour = "black", linewidth = 1), 
+        axis.ticks = element_line(colour = "black", linewidth = 0.25),
+        legend.position = "bottom") +
+  coord_equal() +
+  monocle3:::monocle_theme_opts()
+save_plot("Plots/all_treatments.jpeg", p, base_height = 2.5)
+
+```
+
+# Figure 4C
+```{r, box plot for individual cell types and selected molecules}
+
+cell_types = c(progenitor = "RPC", prolif_progen = "RPCprolif", 
+               pre_progen = "RPCproneural", chp = "CP", npre = "Npre", 
+               rgcpre = "RGCpre", rgc = "RGC", hapre = "HApre", 
+               pbpre = "PBpre", diff_neuron = "CN", diff_rpe = "RPE", 
+               telen = "RG", radial = "ONHprog", rgs_tafa = "Undefined")
+
+i = 0
+
+for (ct in cell_types) {
+  i=i+1
+  # get the treatments that are significantly changed
+      pattern = as.character(hm_plot %>%
+        filter(sig_fc == TRUE,
+               cell_group == ct) %>%
+        pull(treatment))
+      
+      celltype_gather_fc = merge(celltype_gather, fc_df, 
+                                 by = c("treatment", "cell_type"), all.x = TRUE) %>%
+        filter(cell_type == ct) %>%
+        mutate(highlight = case_when((treatment %in% pattern & abund_log2fc > 0) ~ 1,
+                                      (treatment %in% pattern & abund_log2fc < 0) ~ -1,
+                                     treatment == "BMP" ~ 2,
+                                     TRUE ~ 0))  
+
+    # plot 
+    gg1 = celltype_gather_fc %>% 
+      filter(cell_type == ct) %>%
+      ggplot(aes(x=factor(treatment, 
+                          levels = c("BMP", "CHIR", "SU5402:CHIR")), 
+                 y=as.numeric(cells), 
+                 fill = as.factor(highlight))) + 
+      geom_violin(scale = "width", lwd = 0.2) +
+      geom_quasirandom(size = 0.1, alpha = 0.4) +
+      scale_fill_manual(values = c("#009FB8", "lightgrey", "#D65108", "grey43"),
+                         breaks = c("-1", "0", "1", "2"),
+                         labels = c("Decreased", "Unchanged", "Increased", "Control")) +
+      expand_limits(y = 0) +
+      monocle3:::monocle_theme_opts() +
+      ylab("Normalized Cell Counts") + labs(title = ct) +
+      theme(legend.position = "none",
+            text = element_text(size = 14),
+            plot.title = element_text(hjust = 0.5),
+            axis.title.x = element_blank(),
+            axis.text.x = element_text(angle = 25, vjust = 1, hjust = 1),
+            panel.spacing = unit(1.2, "lines")) 
+    
+    print(names(cell_types)[i])
+    save_plot(paste0("Plots/violin_BMP_vs_", 
+                     names(cell_types)[i], "_highlight.jpeg"), gg1, 
+              base_width = 2.2, base_height = 3)
+}
+
+```
+
+# Figure 4D
+```{r sort out the organoids with too few cells}
+
+# get counts of cells in each cell type
+hash_df = cds@colData %>% as.data.frame() %>%
+  group_by(top_oligo, cell_type, treatment) %>%
+  dplyr::count()
+
+# get total cells per oligo
+total_cells  = hash_df %>% ungroup(cell_type) %>% 
+  dplyr::summarise(total_cells = sum(n)) %>% select(-treatment)
+merge_hash_df = left_join(hash_df, total_cells, by = "top_oligo")
+merge_hash_df = merge_hash_df %>% mutate(pct_ct = n/total_cells) %>% filter(total_cells > 50)
+
+```
+
+```{r plot stacked barplots}
+
+# get cv for each cell type
+cv_all = merge_hash_df %>% 
+  ungroup(top_oligo) %>%
+  dplyr::summarise(stdev = sd(n), mean = mean(n)) %>%
+  mutate(cv = stdev/mean)
+treatments = unique(merge_hash_df$treatment)
+
+for (treat in treatments) {
+  # filter df and cv df for only a single treatment
+  treat_df = merge_hash_df %>% filter(treatment == treat)
+  cv_order = cv_all %>% filter(treatment == treat) %>%
+    arrange(mean) %>% pull(cell_type)
+  
+  # get order from high to low of top_oligo for the most abundant cells type
+  i = length(cv_order)
+  hl_top_ct = treat_df %>% filter(cell_type == cv_order[i]) %>% 
+    arrange(desc(pct_ct))
+  
+  gg = ggplot(treat_df, aes(fill=factor(cell_type, 
+                                         levels = c("Unknown", "Transition", "RPE", 
+                                                    "CP", "RG", "CN", "ONHprog", 
+                                                    "PBpre", "HApre", "RGC", 
+                                                    "RGCpre", "Npre", "RPCproneural", 
+                                                    "RPCprolif", "RPC")), 
+                             y=n, 
+                             x=factor(top_oligo,
+                                     levels = hl_top_ct$top_oligo))) +
+    geom_bar(position="fill", stat="identity") +
+    xlab("Organoid") + ylab("% Cell Type") +
+    monocle3:::monocle_theme_opts() +
+    scale_fill_discrete(name = "Cell Type") +
+    scale_fill_manual(values = colors$V2, limits = colors$V1) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0))) +
+    theme(legend.position = "none",
+          axis.text.x = element_blank())
+  save_plot(paste0("Plots/barplot_indiv2_", treat, ".jpeg"), gg, 
+            base_height = 2, base_width = 4)
+}
+
+```
+
+# Preparation of dataframes for plotting violin plots for Figure 4F-G and Figure S4M-O
+```{r get into a table of cell counts using broad cell types}
+
+cds_summary = coldata_df %>%
+  group_by(top_oligo, cell_type_broad, .drop = F) %>%
+  dplyr::summarize(cells = n())
+
+cell_counts_wide = tidyr::spread(cds_summary, cell_type_broad, cells, fill=0)
+top_oligo = as.character(cell_counts_wide %>% pull("top_oligo"))
+cell_counts_wide = as.matrix(cell_counts_wide[,2:ncol(cell_counts_wide)])
+row.names(cell_counts_wide) = top_oligo
+cell_counts_wide = t(cell_counts_wide) # cell types x top_oligo
+
+# can filter by total count in well
+cell_counts_wide = cell_counts_wide[,colSums(cell_counts_wide) > 50] 
+coldata_df = coldata_df %>% filter(top_oligo %in% colnames(cell_counts_wide))
+
+# account for size factors 
+covariates_df = coldata_df %>% dplyr::select(top_oligo, plate, treatment) %>%
+  distinct() %>% as.data.frame %>% 
+  arrange(top_oligo)
+rownames(covariates_df) = covariates_df$top_oligo
+
+cell_count_cds = new_cell_data_set(expression_data = cell_counts_wide,
+                                   cell_metadata = covariates_df[colnames(cell_counts_wide), ])
+cds_summary$size_factor = size_factors(cell_count_cds)[cds_summary$top_oligo]
+cds_summary = cds_summary %>% mutate(cells= round(cells/size_factor)) 
+
+```
+
+```{r load data from the images and merge}
+
+cds_sum_wide = pivot_wider(cds_summary, names_from = cell_type_broad, values_from = cells)
+
+image_df = fread("d60_image_quant.csv")
+image_df = image_df %>% select(treatment, top_oligo, perc_retina, 
+                               `perc_non-retina`, perc_rpe, perc_lens)
+merge_df = merge(cds_sum_wide, image_df, by = "top_oligo")
+
+# calculate total cells
+merge_df$total_cells = merge_df$Retina + merge_df$RPE + merge_df$Other
+
+# calculate %
+merge_df$sc_perc_retina = merge_df$Retina / merge_df$total_cells
+merge_df$sc_perc_rpe = merge_df$RPE / merge_df$total_cells
+merge_df$sc_perc_other = merge_df$Other / merge_df$total_cells
+
+```
+
+```{r, get p-values by t-test}
+
+p1 = pairwise_t_test(merge_df, `perc_retina` ~ treatment, 
+                     p.adjust.method = "bonferroni", ref.group = "BMP")
+p2 = pairwise_t_test(merge_df, `perc_non-retina` ~ treatment, 
+                     p.adjust.method = "bonferroni", ref.group = "BMP")
+p3= pairwise_t_test(merge_df, perc_rpe ~ treatment, 
+                    p.adjust.method = "bonferroni", ref.group = "BMP")
+p4 = pairwise_t_test(merge_df, `Retina` ~ treatment, 
+                     p.adjust.method = "bonferroni", ref.group = "BMP")
+p5 = pairwise_t_test(merge_df, `Other` ~ treatment, 
+                     p.adjust.method = "bonferroni", ref.group = "BMP")
+p6= pairwise_t_test(merge_df, RPE ~ treatment, 
+                    p.adjust.method = "bonferroni", ref.group = "BMP")
+image_sum = rbind(p1,p2,p3, p4, p5, p6)
+
+```
+
+# Figure 4F
+```{r make fold change calculations for imaging data}
+
+# filter treatment and control groups
+treatments <- unique(merge_df$treatment)
+ctrl_groups <- grep("^BMP$", treatments, value = TRUE, )
+test_groups <- grep("^BMP$", treatments, invert = TRUE, value = TRUE)
+
+# pivot the celltype_df
+all_summary = merge_df %>% 
+  pivot_longer(cols = c("perc_retina", "perc_non-retina", "perc_rpe"), 
+               names_to = "image_cell_types", values_to = "cells")
+
+# control summary table
+control_df = all_summary %>%
+    filter(treatment == "BMP") %>%
+    group_by(treatment, image_cell_types) %>% 
+    dplyr::summarize(ctrl_mean = mean(cells)) %>% 
+    ungroup() %>% 
+    distinct(image_cell_types, ctrl_mean)
+  
+# perturbation summary table
+fc_df = all_summary %>%
+    filter(treatment != "BMP") %>% 
+    group_by(treatment, image_cell_types) %>% 
+    dplyr::summarize(mol_mean = mean(cells)) %>% 
+    left_join(control_df, by = "image_cell_types") %>% 
+    mutate(abund_log2fc = log2((mol_mean + 1)/(ctrl_mean+1)))
+
+```
+
+```{r make violin plots like what I have for the beta-binomial test data for imaging data}
+
+cell_types = c(Retina = "perc_retina", Other = "perc_non-retina", RPE = "perc_rpe")
+i = 0
+
+for (ct in cell_types) {
+  i=i+1
+  # get the treatments that are significantly changed
+      pattern = as.character(image_sum %>% filter(p.adj < 0.05, .y. == ct) %>%
+        pull(group2))
+
+      
+      celltype_gather_fc = merge(all_summary, fc_df, 
+                                 by = c("treatment", "image_cell_types"), 
+                                 all.x = TRUE) %>%
+        filter(image_cell_types == ct) %>%
+        mutate(highlight = case_when((treatment %in% pattern & abund_log2fc > 0) ~ 1,
+                                      (treatment %in% pattern & abund_log2fc < 0) ~ -1,
+                                     treatment == "BMP" ~ 2,
+                                     TRUE ~ 0))  
+    # plot 
+    gg1 = celltype_gather_fc %>% 
+      filter(image_cell_types == ct) %>%
+      ggplot(aes(x=factor(treatment, 
+                          levels = c("BMP", "CHIR", "SU5402:CHIR")), 
+                 y=as.numeric(cells) * 100, 
+                 fill = as.factor(highlight))) + 
+      geom_violin(scale = "width", lwd = 0.2) +
+      geom_quasirandom(size = 0.1, alpha = 0.4) +
+      scale_fill_manual(values = c("#009FB8", "lightgrey", "#D65108", "grey43"),
+                         breaks = c("-1", "0", "1", "2"),
+                         labels = c("Decreased", "Unchanged", "Increased", "Control")) +
+      expand_limits(y = 0) +
+      monocle3:::monocle_theme_opts() +
+      ylab(paste0(names(cell_types)[i], " (% Area)")) + 
+      theme(legend.position = "none",
+            text = element_text(size = 12),
+            plot.title = element_text(hjust = 0.5),
+            axis.title.x = element_blank(),
+            axis.text.x = element_text(angle = 30, vjust = 1, hjust = 1),
+            panel.spacing = unit(1.2, "lines")) 
+
+    save_plot(paste0("Plots/violin_BMP_vs_", 
+                     names(cell_types)[i], "_highlight_images.jpeg"), 
+              gg1, base_width = 3, base_height = 3.5)
+}
+
+```
+
+# Figure 4G
+```{r make fold change calculations for sc data}
+
+# filter treatment and control groups
+treatments <- unique(merge_df$treatment)
+ctrl_groups <- grep("^BMP$", treatments, value = TRUE, )
+test_groups <- grep("^BMP$", treatments, invert = TRUE, value = TRUE)
+
+
+# pivot the celltype_df
+all_summary = merge_df %>% 
+  pivot_longer(cols = c("Retina", "Other", "RPE"), 
+               names_to = "image_cell_types", values_to = "cells")
+
+# control summary table
+control_df = all_summary %>%
+    filter(treatment == "BMP") %>%
+    dplyr::group_by(image_cell_types) %>% 
+    dplyr::summarize(ctrl_mean = mean(cells)) %>% 
+    ungroup() %>% 
+    distinct(image_cell_types, ctrl_mean)
+  
+# perturbation summary table
+fc_df = all_summary %>%
+    filter(treatment != "BMP") %>% 
+    group_by(treatment, image_cell_types) %>% 
+    dplyr::summarize(mol_mean = mean(cells)) %>% 
+    left_join(control_df, by = "image_cell_types") %>% 
+    mutate(abund_log2fc = log2((mol_mean + 1)/(ctrl_mean+1)))
+  
+fc_df
+
+```
+
+```{r make violin plots like what I have for the beta-binomial test data for sc data}
+
+cell_types = c(Retina = "Retina", Other = "Other", RPE = "RPE")
+i = 0
+
+for (ct in cell_types) {
+  i=i+1
+  # get the treatments that are significantly changed
+      pattern = as.character(image_sum %>% filter(p.adj < 0.05, .y. == ct) %>%
+        pull(group2))
+      
+      celltype_gather_fc = merge(all_summary, fc_df, 
+                                 by = c("treatment", "image_cell_types"), 
+                                 all.x = TRUE) %>%
+        filter(image_cell_types == ct) %>%
+        mutate(highlight = case_when((treatment %in% pattern & abund_log2fc > 0) ~ 1,
+                                      (treatment %in% pattern & abund_log2fc < 0) ~ -1,
+                                     treatment == "BMP" ~ 2,
+                                     TRUE ~ 0))  
+    # plot 
+    gg1 = celltype_gather_fc %>% 
+      filter(image_cell_types == ct) %>%
+      ggplot(aes(x=factor(treatment, 
+                          levels = c("BMP", "CHIR", "SU5402:CHIR")), 
+                 y=as.numeric(cells), 
+                 fill = as.factor(highlight))) + 
+      geom_violin(scale = "width", lwd = 0.2) +
+      geom_quasirandom(size = 0.1, alpha = 0.4) +
+      scale_fill_manual(values = c("#009FB8", "lightgrey", "#D65108", "grey43"),
+                         breaks = c("-1", "0", "1", "2"),
+                         labels = c("Decreased", "Unchanged", "Increased", "Control")) +
+      expand_limits(y = 0) +
+      monocle3:::monocle_theme_opts() +
+      ylab(paste0(names(cell_types)[i], " (Normalized Cell Counts)")) + 
+      theme(legend.position = "none",
+            text = element_text(size = 12),
+            plot.title = element_text(hjust = 0.5),
+            axis.title.x = element_blank(),
+            axis.text.x = element_text(angle = 30, vjust = 1, hjust = 1),
+            panel.spacing = unit(1.2, "lines")) 
+    
+    print(names(cell_types)[i])
+    save_plot(paste0("Plots/violin_BMP_vs_", 
+                     names(cell_types)[i], "_highlight_sc.jpeg"), 
+              gg1, base_width = 3, base_height = 3.5)
+}
+
+```
+
+# load data for Figures S4A-D
+```{r load data}
+
+# this is the unfiltered data, can be generated from GEO metadata and matrix
+all_cds = readRDS("220616-d60_organoids_cds_with_hash_data.RDS")
+
+```
+
+# Figure S4A-D
+```{r make knee plots}
+
+# RNA knee plot
+breaks_for_plot_x = c(1, 10, 100, 1000, 10000, 100000)
+breaks_for_plot_y = c(1, 10, 30, 100, 300, 1000, 3000, 10000, 100000)
+
+p = all_cds@colData %>% as.data.frame() %>%
+  dplyr::select(cell, n.umi) %>%
+  arrange(desc(n.umi)) %>%
+  mutate(rank = dplyr::row_number()) %>%
+  ggplot() +
+  geom_line(aes(x = rank,
+                y = n.umi)) +
+  scale_x_log10(breaks = breaks_for_plot_x) +
+  scale_y_log10(breaks = breaks_for_plot_y) +
+  theme_classic() +
+  geom_hline(yintercept = 150, 
+             color = "red") +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1)) + 
+  xlab("Number of cells") +
+  ylab("RNA UMIs")
+
+```
+
+```{r histogram of mito reads}
+
+p4 = all_cds@colData %>% as.data.frame() %>%
+  dplyr::select(cell, perc_mitochondrial_umis) %>%
+  ggplot() +
+  geom_histogram(aes(perc_mitochondrial_umis), bins = 50) +
+  scale_x_continuous(expand = c(0, 0), limits = c(0, 40)) + 
+  scale_y_continuous(expand = c(0,0), labels = function(x) format(x, scientific = TRUE), limits = c(0, 100000)) +
+  monocle3:::monocle_theme_opts() +
+  xlab("% Mitochondrial UMIs") +
+  ylab("Cell Count") +
+  geom_vline(xintercept = 15, col = "red") +
+  theme(axis.text.y = element_text(angle = 30))
+
+```
+
+```{r make top ratio plots}
+
+p2 = all_cds@colData %>% as.data.frame() %>%
+  dplyr::select(cell, top_to_second_best_ratio) %>%
+  ggplot() +
+  geom_histogram(aes(log2(top_to_second_best_ratio)), bins = 100) +
+  scale_x_continuous(limits = c(0,8), expand = c(0, 0)) + 
+  scale_y_continuous(expand = c(0, 0), 
+                     labels = function(x) format(x, scientific = TRUE), 
+                     limits = c(0, 20000)) +
+  monocle3:::monocle_theme_opts() +
+  xlab("Top to second best ratio (log2)") + ylab("Cell Count") +
+  geom_vline(xintercept = log2(2.5), col = "red") +
+  theme(axis.text.y = element_text(angle = 30))
+
+# need to display the infinite values in some way
+p3 = all_cds@colData %>% as.data.frame() %>%
+  mutate(hash_info = case_when(top_to_second_best_ratio <= 2.5 ~ "<= 2.5",
+                               (top_to_second_best_ratio > 2.5 & 
+                                  top_to_second_best_ratio < Inf) ~ "> 2.5",
+                               top_to_second_best_ratio == Inf ~ "infinite",
+                               is.na(top_to_second_best_ratio) ~ " no hash")) %>%
+  group_by(hash_info) %>%
+  dplyr::count() %>%
+  ggplot(aes(x = hash_info, y = n)) +
+  geom_bar(stat = "identity") +
+  monocle3:::monocle_theme_opts() +
+  scale_y_continuous(expand = c(0, 0), 
+                     labels = function(x) format(x, scientific = TRUE), 
+                     limits = c(0, 200000)) +
+  xlab("Top to second best ratio") + ylab("Cell Count") +
+  theme(axis.text.y = element_text(angle = 30))
+
+```
+
+```{r summary image}
+
+pg = plot_grid(p, p4, p2, p3, rel_widths = c(1, 1, 1.25, 1), nrow = 1)
+save_plot("Plots/hash_combined.jpeg", pg, base_height = 3, base_width = 12)
+
+```
+
+# Figure S4E
+```{r count the number of cells per organoid}
+
+coldata_df = cds@colData %>% as.data.frame()
+
+to_count_df = coldata_df %>%
+  group_by(treatment, top_oligo) %>%
+  dplyr::summarize(n = n()) 
+
+summ = to_count_df %>%
+  dplyr::summarize(n = n())
+max = to_count_df %>%
+  dplyr::summarize(max = max(n))
+min = to_count_df %>%
+  ungroup() %>%
+  dplyr::summarise(mean = mean(n)) 
+
+count_violin = coldata_df %>%
+  filter(top_oligo %in% to_count_df$top_oligo) %>%
+  group_by(top_oligo, treatment) %>%
+  dplyr::count() %>%
+  ggplot(aes(x = factor(treatment, levels = c("BMP", "CHIR", "SU5402:CHIR")), 
+                        y = n, fill = treatment)) +
+  geom_violin() +
+  geom_text(data = summ,
+    aes(label = n, y = 100 + max$max),
+    position = position_dodge(0.9),
+    vjust = 0) +
+  monocle3:::monocle_theme_opts() +
+  scale_fill_manual(values = treat_colors$V3, limits = treat_colors$V1) +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1, vjust = 1),
+        axis.title.x = element_blank(),
+        legend.position = "none") +
+  ylab("Cells per organoid") 
+save_plot("Plots/violin_cells_per_organoid.jpeg", count_violin, 
+          base_height = 3, base_width = 2.25)
+
+```
+
+# Figure S4F
+```{r plot n.umi per organoid per treatment}
+
+numi_boxplot = cds@colData %>% as.data.frame() %>%
+  group_by(treatment, top_oligo) %>%
+  dplyr::summarize(median = median(n.umi)) %>%
+  ggplot(aes(x = factor(treatment, levels = c("BMP", "CHIR", "SU5402:CHIR")), 
+                        y = median, fill = treatment)) +
+  geom_violin() +
+  geom_boxplot(width = 0.1) +
+  scale_y_continuous(trans = "log2", breaks = c(300, 400, 500, 600)) +
+  monocle3:::monocle_theme_opts() +
+  scale_fill_manual(values = treat_colors$V3, limits = treat_colors$V1) +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1, vjust = 1),
+        axis.title.x = element_blank(),
+        legend.position = "none") +
+  ylab("UMIs per Cell per Organoid") 
+save_plot("Plots/bp_umis_per_organoid.jpeg", numi_boxplot, base_height = 3, base_width = 2.25)
+
+```
+
+# Figure S4G
+```{r make the plots for the number of genes/features per organoid}
+
+cds = detect_genes(cds) 
+
+nfeature_boxplot = cds@colData %>% as.data.frame() %>%
+  group_by(treatment, top_oligo) %>%
+  dplyr::summarize(median = median(num_genes_expressed)) %>%
+  ggplot(aes(x = factor(treatment, levels = c("BMP", "CHIR", "SU5402:CHIR")), 
+                        y = median, fill = treatment)) +
+  geom_violin() +
+  geom_boxplot(width=0.1) +
+  scale_y_continuous(trans = "log2", breaks = c(250, 300, 350, 400, 450, 500)) +
+  monocle3:::monocle_theme_opts() +
+  scale_fill_manual(values = treat_colors$V3, limits = treat_colors$V1) +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1, vjust = 1),
+        axis.title.x = element_blank(),
+        legend.position = "none") +
+  ylab("Features per Cell per Organoid") 
+
+nfeature_boxplot
+
+save_plot("Plots/bp_features_per_organoid.jpeg", nfeature_boxplot, base_height = 3, base_width = 2.25)
+
+```
+
+# Figure S4H
+```{r feature plots}
+
+genes = c("RAX", "VSX2", # retinal progenitor
+                      "MKI67",
+                      "ATOH7", "HES6", # Npre
+                      "POU4F2", "ISL1", # RGCpre + RGC
+                      "PROX1", "TFAP2A", # HApre
+                      "OTX2", "CRX", # PBpre
+                      "NES", "SOX2", "VIM", # optic nerve head
+                      "MYT1L", "BCL11B", # cortical neuron
+                      "FOXG1", "GLI3", "PTN", "SOX1", "HES1", # radial glia
+                      "TTR", "LMX1A", # choroid plexus
+                      "TYRP1", "TYR" # RPE
+                      ) 
+
+p = plot_cells(cds, genes = genes, 
+               cell_size = 0.3, label_cell_groups = F,
+               scale_to_range = T) + 
+  theme_void() + monocle3:::monocle_theme_opts() +
+  theme(panel.background = element_rect(color = "black", fill = "white"),
+        plot.background = element_rect(fill = "white", colour = "NA"),
+        legend.position = "right")
+save_plot("Plots/cell_feature_umap.jpeg", p, base_height = 6, base_width = 8)
+
+```
+
+# Figure S4I
+```{r cell type specific violin plots}
+
+# see the code chunk for Figure 4C
+
+```
+
+# code to prepare for Figures S4J-L
+```{r function to generate normalized cell counts}
+
+new_cell_count_set <- function(cds,
+                               sample_group,
+                               cell_group,
+                               sample_metadata = NULL,
+                               cell_metadata = NULL,
+                               lower_threshold = NULL,
+                               upper_threshold = NULL) {
+
+    # check if anything contains NAs in it
+    # if so drop them
+    num_sample_group_NAs = sum(is.na(colData(cds)[[sample_group]]))
+    if (num_sample_group_NAs != 0) {
+      message(paste(num_sample_group_NAs, "NAs found in sample group. Dropping NAs."))
+      cds = cds[, !is.na(colData(cds)[[sample_group]])]
+    }
+  
+    num_cell_group_NAs = sum(is.na(colData(cds)[[cell_group]]))
+    if (num_cell_group_NAs != 0) {
+      message(paste(num_cell_group_NAs, "NAs found in cell group. Dropping NAs."))
+      cds = cds[, !is.na(colData(cds)[[cell_group]])]
+    }
+  
+    coldata_df = colData(cds) %>% tibble::as_tibble()
+    coldata_df = coldata_df %>% dplyr::rename_("sample" = sample_group, 
+                                               "cell_group" = as.character(cell_group))
+    coldata_df$group_id = coldata_df %>%
+      dplyr::group_indices_("sample", "cell_group") %>% as.character
+    # add to cds
+    colData(cds)$group_id = coldata_df$group_id
+  
+    cds_summary = coldata_df %>%
+      dplyr::group_by_("sample", "cell_group") %>%
+      dplyr::summarize(cells = dplyr::n())
+  
+    cds_covariates_df = coldata_df %>%
+      dplyr::group_by_("sample") %>%
+      dplyr::summarize(across(where(is.numeric), mean),
+                       across(where(is.factor), 
+                              function(x) { tail(names(sort(table(x))), 1) }),
+                       across(where(is.character), 
+                              function(x) { tail(names(sort(table(x, useNA="ifany"))), 1)
+                                } ))
+  
+    if (is.null(sample_metadata) == FALSE){
+      cds_covariates_df = left_join(cds_covariates_df, sample_metadata,
+                                    by=c("sample"="sample"))
+      }
+  
+    cds_covariates_df = cds_covariates_df %>% as.data.frame(cds_covariates_df)
+    row.names(cds_covariates_df) = cds_covariates_df %>% dplyr::pull(sample)
+  
+    cell_counts_wide = tidyr::spread(cds_summary, sample, cells, fill=0)
+    cell_states = as.character(cell_counts_wide %>% dplyr::pull("cell_group"))
+    cell_counts_wide = as.matrix(cell_counts_wide[,2:ncol(cell_counts_wide)])
+  
+    row.names(cell_counts_wide) = cell_states
+  
+    # filter out cell groups based on counts
+    if (is.null(lower_threshold) == FALSE) {
+      cell_counts_wide = 
+        cell_counts_wide[Matrix::rowSums(cell_counts_wide) >= lower_threshold, ]
+    }
+    if (is.null(upper_threshold) == FALSE) {
+      cell_counts_wide = 
+        cell_counts_wide[Matrix::rowSums(cell_counts_wide) <= upper_threshold, ]
+    }
+  
+    cds_covariates_df = cds_covariates_df[colnames(cell_counts_wide),]
+  
+    # This is super confusing because of the way the arguments are named in new_cell_data_set.
+    # We are making a matrix of dimension MxN, where M are cell types and N are samples 
+    ccs = methods::new("cell_count_set",
+                 monocle3::new_cell_data_set(cell_counts_wide,
+                                             cell_metadata=cds_covariates_df,
+                                             gene_metadata=cell_metadata),
+                 cds=cds,
+                 info = SimpleList(sample_group = sample_group,
+                                   cell_group = cell_group))
+    ccs@metadata[["cell_group_assignments"]] = coldata_df %>% 
+      dplyr::select(group_id, sample, cell_group) %>% as.data.frame
+    row.names(ccs@metadata[["cell_group_assignments"]]) = colnames(cds)
+    return (ccs)
+}
+
+```
+
+```{r load cell count data}
+
+# assign best celltype column and reduce dims
+colData(cds)$cluster = monocle3::clusters(cds)
+colData(cds)$Size_Factor = size_factors(cds)
+
+# generate cell_count_set
+ccs = new_cell_count_set(cds,
+                         sample_group = "top_oligo",
+                         cell_group = "cluster")
+# get coldata as dataframe
+coldata = cds@colData %>% as.data.frame()
+
+# edit BMP to be the reference
+coldata$treatment = gsub("BMP", "0BMP", coldata$treatment)
+
+```
+
+Now we can compare how the variance in cell types across organoids scales according to their mean.
+Let's do the testing the right way, accounting for the std error
+
+```{r cache=FALSE}
+
+tidy.vglm = function(x, conf.int=FALSE, conf.level=0.95) {
+  co <- as.data.frame(coef(summary(x)), stringsAsFactors=FALSE)
+  names(co) <- c("estimate","std.error","statistic","p.value")
+  if (conf.int) {
+    qq <- qnorm((1+conf.level)/2)
+    co <- transform(co,
+                    conf.low=estimate-qq*std.error,
+                    conf.high=estimate+qq*std.error)
+  }
+  co <- data.frame(term=rownames(co),co, stringsAsFactors=FALSE)
+  rownames(co) <- NULL
+  return(co)
+}
+
+est_cells_per_org = function(x, cell_df, model_formula_str) {
+    type_df = cell_df %>% dplyr::filter(cluster == x)
+    count_df = cbind(type_df$cells, type_df$total_cells - type_df$cells)
+    
+    # We could also do this via method of moments
+    fit =  suppressWarnings(VGAM::vglm(as.formula(model_formula_str), 
+                            data = type_df, 
+                            #family = negbinomial(zero=NULL), 
+                            family=betabinomial(zero=NULL),
+                            trace = FALSE))
+    fit_df = suppressWarnings(tidy.vglm(fit))
+
+    # Totally stupid I have to do this:
+    sim_res = as.matrix(simulate(fit, nsim=100))
+    rep_means = colMeans(sim_res)
+    rep_sds = colSds(sim_res)
+    
+    cells_per_org = mean(rep_means) 
+    cells_per_org.stddev = mean(rep_sds)
+    cells_per_org.stderr = cells_per_org.stddev/sqrt(nrow(type_df))
+    cells_per_org_cv = mean(rep_sds / rep_means)
+    cells_per_org_cv.stddev = sd(rep_sds / rep_means)
+    cells_per_org_cv.stderr = cells_per_org_cv.stddev / sqrt(nrow(type_df))
+    
+    fit_df2 = data.frame(cells_per_org, 
+                        cells_per_org.stddev, 
+                        cells_per_org.stderr,
+                        cells_per_org_cv,
+                        cells_per_org_cv.stddev,
+                        cells_per_org_cv.stderr,
+                        num_orgs=nrow(type_df)
+                        )
+    return(fit_df2)
+}
+
+calculate_dispersions = function(cell_df, verbose=FALSE, model_formula_str="~1"){
+  cell.types = unique(cell_df$cluster)
+
+  #model_formula_str = paste("cells", model_formula_str)
+   model_formula_str = paste("count_df", model_formula_str)
+  test_res = sapply(cell.types, FUN = function(x) {
+    tryCatch({
+      est_cells_per_org(x, cell_df, model_formula_str)},
+      error = function(e) {NULL})
+    }, 
+    USE.NAMES = T, simplify = F)
+  test_res = do.call(rbind, test_res)
+  test_res = test_res %>% tibble::rownames_to_column(var = "cell_group")
+  test_res$cell_group = str_split_fixed(test_res$cell_group, "\\.", 2)[,1]
+  return(test_res)
+}
+
+```
+
+
+```{r, cache=FALSE}
+
+org_summary = coldata %>% 
+  group_by(treatment, top_oligo, "cluster" = cluster) %>%
+  summarize(cells = n())
+
+org_summary$size_factor = size_factors(ccs)[org_summary$top_oligo]
+org_summary = org_summary %>% 
+  mutate(cells = round(cells / size_factor))
+
+# calculate and filter mean cells per treatment for each type
+cell_summary = org_summary %>% 
+  ungroup() %>% 
+  select(treatment, top_oligo, cluster, cells) %>% 
+  group_by(treatment, cluster) %>% 
+  tally(name = "emb_num")
+
+celltype_means = org_summary %>% 
+  ungroup() %>% 
+  select(treatment, top_oligo, cluster, cells) %>% 
+  group_by(treatment, cluster) %>% 
+  summarize(sum_cells = sum(cells)) %>% 
+  left_join(cell_summary, by = c("treatment", "cluster")) %>% 
+  ungroup() %>% 
+  mutate(mean_per_emb = round(sum_cells/emb_num), 
+         treat_type = paste0(treatment, ".", cluster))
+
+sel_types = celltype_means %>% 
+  filter(mean_per_emb >= 3) %>% 
+  pull(treat_type)
+
+# calculate dispersions after removing cells with very low counts
+cluster_disps = org_summary %>%
+  select(treatment, top_oligo, cluster, cells) %>%
+  ungroup() %>%
+  group_by(top_oligo) %>%
+  mutate(total_cells = sum(cells)) %>%
+  ungroup() %>%
+  mutate(cluster = as.factor(cluster)) %>%
+  pivot_wider(names_from = cluster,
+              values_from = cells, 
+              values_fill = list(cells = 0)) %>%
+  gather(key = cluster, value = cells, -c(treatment, top_oligo, total_cells)) %>%
+  mutate(treat_type = paste0(treatment, ".", cluster)) %>% 
+  filter(treat_type %in% sel_types) %>%
+  select(-treat_type) %>% 
+  group_by(treatment) %>%
+  nest() %>% 
+  arrange(treatment) %>% 
+  mutate(test_res = purrr::map(.x = data, .f = calculate_dispersions)) %>%
+  select(-data) %>%
+  unnest(cols = c(test_res))
+
+```
+
+# determine which of the cell types are especially variable
+```{r cache=FALSE}
+
+# fit model
+mod = VGAM::vglm(cells_per_org_cv ~ I(1/cells_per_org) + as.factor(treatment), data=cluster_disps, family=gammaR(zero=NULL, lrate="identitylink", lshape="identitylink"), maxit=100)
+
+
+ilink <- mod@family@linkinv
+
+vgam_inv_gammaR_mean <- function (eta, extra = NULL) 
+{
+    Ratee <- eta2theta(eta[, c(TRUE, FALSE)], "identitylink", earg = list(
+        inverse = FALSE, deriv = 0, 
+        short = TRUE, tag = FALSE))
+    Shape <- eta2theta(eta[, !(c(TRUE, FALSE))], "identitylink", earg = list(
+        inverse = FALSE, deriv = 0, 
+        short = TRUE, tag = FALSE))
+    Shape/Ratee
+}
+
+vgam_inv_gammaR_var <- function (eta, extra = NULL) 
+{
+    Ratee <- eta2theta(eta[, c(TRUE, FALSE)], "identitylink", earg = list(
+        inverse = FALSE, deriv = 0, 
+        short = TRUE, tag = FALSE))
+    Shape <- eta2theta(eta[, !(c(TRUE, FALSE))], "identitylink", earg = list(
+        inverse = FALSE, deriv = 0, 
+        short = TRUE, tag = FALSE))
+    Shape/(Ratee^2)
+}
+
+
+cluster_disps$model_fit = vgam_inv_gammaR_mean(predict(mod, newdata=cluster_disps))
+cluster_disps$model_sd = sqrt(vgam_inv_gammaR_var(predict(mod, newdata=cluster_disps)))
+
+
+cluster_disps = cluster_disps %>% 
+  mutate(model_fit_lower = model_fit - 2 * model_sd,
+         model_fit_upper = model_fit + 2 * model_sd)
+
+cluster_disps = cluster_disps %>% 
+  mutate(cv_test_stat = (cells_per_org_cv - model_fit) / model_sd,
+           cv_z_stat_p_val = 1 - pnorm(cv_test_stat))
+
+```
+
+# Figure S4J
+```{r get the clusters that are highly variable in each treatment and plot on the UMAP}
+
+# plot the clusters used
+p = plot_cells(cds, label_cell_groups = F) +
+  theme_void() + monocle3:::monocle_theme_opts() +
+  theme(legend.position = "none")
+save_plot("Plots/umap_clusters.jpeg", p, base_width = 4, base_height = 4)
+
+# plot the sig clusters
+sig_clusters = plot_df %>% filter(cv_z_stat_p_val < sig_thresh) %>% select(cell_group)
+treatments = unique(plot_df$treatment)
+
+for (i in treatments) {
+  
+  treat_sig_clusters = sig_clusters %>% filter(treatment == i)
+  selected_color = treat_colors %>% filter(treat_colors$V1 == i)
+  
+  p = plot_cells(cds, color_cells_by = "cluster", label_cell_groups = F) + 
+    scale_color_manual(values = rep(selected_color$V3,
+                                    length(treat_sig_clusters$cell_group))) +
+    gghighlight(cluster %in% treat_sig_clusters$cell_group) +
+    theme_void() + monocle3:::monocle_theme_opts()
+  save_plot(paste0("Plots/sig_clusters", i, ".jpeg"), p, 
+            base_width = 4, base_height = 4)
+}
+
+```
+
+# Figure S4K
+```{r plot selected times for figure}
+
+sig_thresh = 0.05
+plot_df = cluster_disps %>% 
+         filter(cells_per_org > 3, treatment %in% c("0BMP", "CHIR",  "SU5402:CHIR"))
+
+plot_df$treatment = gsub("0BMP", "BMP", plot_df$treatment)
+
+p = ggplot(data=plot_df) + 
+  geom_line(aes(cells_per_org, model_fit, color=treatment), data=plot_df) + 
+  geom_ribbon(aes(cells_per_org, ymin=model_fit_lower, ymax=model_fit_upper,
+                  color=treatment), alpha=0.2) +
+  geom_point(aes(cells_per_org, cells_per_org_cv, color=treatment), size = 2) + 
+  geom_linerange(aes(cells_per_org, 
+                     ymin=cells_per_org_cv - cells_per_org_cv.stderr, 
+                     ymax=cells_per_org_cv + cells_per_org_cv.stderr),
+                data=plot_df %>% filter(cv_z_stat_p_val < sig_thresh)) +
+  facet_wrap(~treatment, nrow = 1) +
+  scale_color_manual(values = treat_colors$V3, limits = treat_colors$V1)  +
+  scale_y_log10() +
+  scale_x_log10() +
+  theme_classic() +
+  theme(legend.position = "none",
+        text = element_text(size = 16)) +
+  ylab("Estimated CV") + xlab("Cells per Cluster")
+save_plot("Plots/model_fit.jpeg", p, base_width = 7, base_height = 3.8)
+
+```
+
+# Figure S4L
+```{r model fit boxplot}
+
+org_color = colors %>% filter(V1 %in% c("RPC", "RPCprolif", "RPCproneural", 
+                        "Npre", "RGCpre", "RGC", "HApre", "PBpre",
+                        "ONHprog", "CN",
+                        "Transition", "RG", "CP",  
+                        "RPE"))
+
+cell_type_key = cds@colData %>% as.data.frame() %>% 
+  group_by(cluster, cell_type) %>% dplyr::count() %>%
+    select(cluster, cell_type)
+
+celltype_disps = merge(cluster_disps, cell_type_key, by.y = "cluster", by.x = "cell_group")
+
+p = ggplot(celltype_disps %>% 
+         filter(cells_per_org > 3), 
+       aes(x = reorder(cell_group, cv_test_stat, FUN = median), y = cv_test_stat, fill = cell_type)) + 
+  geom_boxplot(outlier.size = 0.5) + 
+  scale_fill_manual(limits = org_color$V1, values = org_color$V2) +
+  #coord_flip() +
+  theme_classic() +
+  guides(fill=guide_legend(nrow=2,byrow=TRUE)) +
+  theme(legend.position = "none", 
+        legend.title = element_blank(),
+        text = element_text(size=16),
+        axis.text.x = element_text(size = 14),
+        axis.line = element_line(color = "black"), axis.ticks = element_line(color = "black")) +
+  xlab("Cluster") + ylab("CV test stat")
+
+save_plot("Plots/cv_cell_types_ranked.jpeg", p, base_width = 14, base_height = 3.75)
+
+```
+
+# Figure S4M
+```{r cell type specific violin plots for % area calcs}
+
+# see the code chunk for Figure 4F
+
+```
+
+# Figure S4N
+```{r cell type specific violin plots for normalize broad cell type counts}
+
+# see the code chunk for Figure 4G
+
+```
+
+# Figure S4O
+```{r}
+# make sure that the merge df was loaded above
+treat_colors = treat_colors %>% filter(V1 %in% merge_df$treatment)
+
+p = ggplot(merge_df, aes(y = Retina, x = perc_retina * 100, 
+                         color = treatment)) +
+  stat_poly_line(se = F) +
+  stat_poly_eq() +
+  geom_point() +
+  scale_color_manual(limits = treat_colors$V1, values = treat_colors$V3) +
+  monocle3:::monocle_theme_opts() + theme(text = element_text(size = 16), legend.position = "none") +
+  ylab("Retina (normalized cell counts)") + xlab("Retina (% area)")
+save_plot("Plots/retina_image_sc_scatter.jpeg", p, base_width = 5, base_height = 4.2)
+
+p = ggplot(merge_df, aes(y = RPE, x = perc_rpe * 100, 
+                         color = treatment)) + 
+  stat_poly_line(se = F) +
+  stat_poly_eq() +
+  geom_point() +
+  scale_color_manual(limits = treat_colors$V1, values = treat_colors$V3) +
+  monocle3:::monocle_theme_opts() + theme(text = element_text(size = 16), legend.position = "none") +
+  ylab("RPE (normalized cell counts)") + xlab("RPE (% area)")
+save_plot("Plots/rpe_image_sc_scatter.jpeg", p, base_width = 5, base_height = 4.2)
+
+p = ggplot(merge_df, aes(y = Other, x = `perc_non-retina` * 100, 
+                     color = treatment)) + stat_poly_line(se = F) +
+  stat_poly_eq() +
+  geom_point() +
+  scale_color_manual(limits = treat_colors$V1, values = treat_colors$V3) +
+  monocle3:::monocle_theme_opts() + theme(text = element_text(size = 16), legend.position = "none") +
+  ylab("Non-retina (normalized cell counts)") + xlab("Non-retina (% area)")
+save_plot("Plots/non-retina_image_sc_scatter.jpeg", p, base_width = 5, base_height = 4.2)
+
+```
+
+# Table S3
+# determine which of the treatments have significantly different variance from BMP (reference)
+```{r lr test for each of the treatments}
+
+treatments = unique(cluster_disps$treatment)
+# need to remove 0BMP (used for comparison) from treatments
+treatments = treatments[!treatments == "0BMP"]
+
+# setup the dfs to which data will be added
+coef_df = data.frame("CHIR" = c(0, 0, 0, 0))
+lr_df = data.frame(`#Df` = 0, LogLik = 0, Df = 0, Chisq = 0, `Pr(>Chisq)` = 0, source = 0)
+i = 1
+
+for (treat in treatments) {
+  
+  cluster_disps_treat = cluster_disps %>% filter(treatment %in% c("0BMP", treat))
+
+  # fit models with and without accounting for the treatment
+  mod1 = VGAM::vglm(cells_per_org_cv ~ I(1/cells_per_org) + as.factor(treatment), 
+                    data=cluster_disps_treat, 
+                    family=gammaR(#zero=NULL, 
+                                  lrate="identitylink", lshape="identitylink"), 
+                    maxit=100)
+  mod1_mat = coef(summary(mod1), matrix = TRUE)[4, ] %>% as.data.frame()
+  coef_df[as.character(treat)] = mod1_mat$.
+  rownames(coef_df) = rownames(mod1_mat)
+  
+  mod2 = VGAM::vglm(cells_per_org_cv ~ I(1/cells_per_org), 
+                    data=cluster_disps_treat, 
+                    family=gammaR(#zero=NULL, 
+                                  lrate="identitylink", lshape="identitylink"), 
+                    maxit=100)
+  
+  # test for significant difference
+  lr_res = lrtest(mod1, mod2)
+  lr_mat = lr_res@Body %>% as.data.frame()
+  lr_mat$source = treat
+  lr_df[i:(i+1), ] = lr_mat 
+  
+  i = i + 2
+  
+}
+
+# adjust p values
+lr_df$p.adjusted = p.adjust(lr_df$Pr..Chisq.)
+
+# save output
+write_csv(coef_df, "Tables/variance_model_coefficients.csv")
+write_csv(lr_df, "Tables/variance_model_lrtest_output.csv")
+
+# save output to manuscript directory
+write_csv(coef_df, "../organoid_project/D63_variance_model_coefficients.csv")
+write_csv(lr_df, "../organoid_project/D63_variance_model_lrtest_output.csv")
+
+```
+
+
+
+
+
+
+

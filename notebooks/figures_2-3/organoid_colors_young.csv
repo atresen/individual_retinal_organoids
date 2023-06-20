@@ -1,0 +1,15 @@
+﻿Optic Vesicle/Progenitor (RAX+),#C7B7AE,Optic Vesicle + RPC,RPC,RPC_OV,#C7B7AE,
+Other 3 (non-retinal),#95A8CA,Cornea,Cornea,OS,#F9C57B,#D9C06B
+Differentiating neuron (non-retinal),#E07D7F,BPC2,BPC2,Telencephalon,#faa63f,#E5AC61
+Optic stalk (PAX2+/VAX1+),#F9C57B,Optic Stalk,Proliferating RPC,Diencephalon,#D28445,
+Other 1 (non-retinal),#faa63f,BPC1,BPC1,Hindbrain,#B5785D,
+Other 2 (non-retinal),#E3483C,BPC3,BPC3,FP,#845348,
+Differentiating retina,#BA4F8F,Retina,Retina,RP,#E3483C,#B53E3E
+Lens,#4D639D,Lens,Lens,Neuron_nonretinal,#D29DB0,
+Differentiating RPE,#6DA48B,RPE,RPE,Retina,#BA4F8F,
+Npre,#49c9a2,Npre,Npre,Cornea,#6C2E76,
+RGCpre,#3AA657,RGCpre,RGCpre,Lens,#4D639D,
+RGC,#3E6E40,RGC,RGC,RPE,#6DA48B,
+Hapre,#a1d278,HApre,HApre,RPC_Proliferating1,#B8BAAD,
+PBpre,#50AAAC,PBpre,PBpre,RPC_Proliferating2,#B8BAAD,
+Proliferating progenitor,#FB936E,BPC4,BPC4,Preneurogenic_OV,#A48565,

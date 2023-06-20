@@ -1,0 +1,656 @@
+---
+title: "Code for plotting Figure 1"
+author: "Amy Tresenrider"
+output: html_document
+---
+
+```{r}
+
+suppressPackageStartupMessages({ 
+  library(tidyverse)
+  library(ggplot2)
+  library(tidyr)
+  library(viridis)
+  library(ggridges)
+  library(purrr)
+  library(monocle3)
+  library(RColorBrewer)
+  library(dplyr)
+  library(dirmult)
+  library(Seurat)
+  library(plotly)
+  library(cowplot)
+  #library(egg)
+  library(gghighlight)
+  library(ggrepel)
+  library(ggpubr)
+  
+  
+  # Pass TRUE if you want to see progress output on some of Monocle 3's operations
+  DelayedArray:::set_verbose_block_processing(TRUE)
+  # Passing a higher value will make some computations faster but use more memory. 
+  # Adjust with caution!
+  options(DelayedArray.block.size=1000e6)
+  # Set a seed to make umap and other non-deterministic steps consistent
+  set.seed(seed = 92)
+  
+})
+```
+
+# load in the data
+```{r}
+
+joint_cds = readRDS("GSE220661_cds_joint_annotated_220712.RDS")
+
+colors = read.csv("organoid_colors.csv",
+                  header = F)
+
+```
+
+# Figure 1B
+```{r}
+
+pc = plot_cells(joint_cds, color_cells_by = "cell_type", cell_size = 0.3,
+                label_cell_groups = F, x = 1, y = 2) +
+  scale_color_manual(limits = colors$V2, values = colors$V1) +
+  theme_void() + theme(legend.position = "none")
+
+d28 = plot_cells(joint_cds, color_cells_by = "age", cell_size = 0.1,
+           label_cell_groups = F, x = 1, y = 2) +
+  scale_color_manual(values = c(D28 = "#e63946", D78 = "#fbce65", D185 = "#578ab5")) +
+  gghighlight(age == "D29") +
+  theme_void() + ggtitle("Day 29") +
+  facet_wrap(~tech)
+
+d78 = plot_cells(joint_cds, color_cells_by = "age", cell_size = 0.1,
+           label_cell_groups = F, x = 1, y = 2) +
+  scale_color_manual(values = c(D28 = "#e63946", D78 = "#fbce65", D185 = "#578ab5")) +
+  gghighlight(age == "D78") +
+  theme_void() + ggtitle("Day 78") +
+  facet_wrap(~tech)
+
+d185 = plot_cells(joint_cds, color_cells_by = "age", cell_size = 0.1,
+           label_cell_groups = F, x = 1, y = 2 ) +
+  scale_color_manual(values = c(D28 = "#e63946", D78 = "#fbce65", D185 = "#578ab5")) +
+  gghighlight(age == "D185") +
+  theme_void() + ggtitle("Day 185") +
+  facet_wrap(~tech)
+
+pg = plot_grid(d28, d78, d185, ncol = 1)
+
+pg2 = plot_grid(pc, pg, rel_widths = c(3, 1.5))
+
+save_plot(pg2, filename = "Plots/combined_3d_celltypes_ages.jpeg", 
+          base_width = 6, base_height = 3)
+
+pg2
+
+```
+
+# Figure 1C
+```{r dot plots of genes used for annotation}
+
+joint_cds$cell_type = factor(joint_cds$cell_type, 
+                                     levels = c("RPC", "Proliferating_RPC", "MG",
+                                                "PAX2high_RLBP1low", "Astrocyte", "Lens",
+                                                "Forebrain", "Neuron_nonretinal", "Roof_Plate",
+                                                "Npre", "RGCpre", "RGC", "HApre", "Amacrine", 
+                                                "Horizontal", "PBpre", "Cone_Blue", "Cone_RG",
+                                                "Rod",  "Unknown", "ON_Bipolar", "OFF_Bipolar")  )
+
+genes = c("RAX", "VSX2", 
+          "MKI67", "TOP2A", 
+          "RLBP1", "AQP4", 
+          "PAX2", "GFAP", 
+          "CRYBB1", 
+          "SOX1", "FOXG1", 
+          "ELAVL4", "DLX6",
+          "GDF7", "LMX1A", 
+          "HES6", "ATOH7",
+          "POU4F2","ISL1", 
+          "PRDM13", "TFAP2A", "PROX1", "ONECUT1", 
+          "CRX", "OTX2", "ARR3", "OPN1SW", "NRL", "VSX1",
+          "GRM6", "GRIK1")
+
+sci_cds = joint_cds[, joint_cds@colData$tech == "sci"]
+tenx_cds = joint_cds[, joint_cds@colData$tech == "10x"]
+
+dp_sci = plot_genes_by_group(sci_cds,
+                    genes,
+                    group_cells_by="cell_type",
+                    ordering_type="none",
+                    max.size=6,
+                    norm_method = "log",
+                    lower_threshold = 0.0001,
+                    scale_max = 1) +
+  scale_color_gradient(low = "#fbce65", high = "#e63946") +
+  theme(axis.title = element_blank(),
+        text = element_text(size = 14),
+        axis.text.x = element_text(angle = 60)) +
+  ggtitle("sci")
+
+dp_10x = plot_genes_by_group(tenx_cds,
+                    genes,
+                    group_cells_by="cell_type",
+                    ordering_type="none",
+                    max.size=6,
+                    norm_method = "log",
+                    lower_threshold = 0.0001,
+                    scale_max = 1) +
+  scale_color_gradient(low = "#fbce65", high = "#e63946") +
+  theme(axis.title = element_blank(),
+        text = element_text(size = 14),
+        legend.position = "none",
+        axis.text.x = element_text(angle = 60)) +
+  ggtitle("10x")
+
+pg = plot_grid(dp_10x, dp_sci, rel_widths = c(1, 1.25))
+
+save_plot(pg, filename = "Plots/combined_dot_plot_genes.jpeg", base_height = 9, base_width = 11)
+
+```
+
+# Figure 1G
+```{r % calculations needed for plotting only some of the cell types}
+
+cell_type3d_wide = pivot_wider(cell_type3d_df, names_from = cell_type, values_from = n)
+
+cell_type3d_wide = cell_type3d_wide %>% remove_rownames %>% 
+  column_to_rownames(var="tech_age") %>%
+  select(-age, -tech)
+cell_type3d_wide[is.na(cell_type3d_wide)] = 0
+cell_type3d_wide$total_cells = rowSums(cell_type3d_wide)
+cell_type3d_wide$tech_age = rownames(cell_type3d_wide)
+
+cell_type3d_long = pivot_longer(cell_type3d_wide, names_to = "cell_type",
+                                cols = cell_types)
+
+cell_type3d_long$percent_cell_type = 
+  cell_type3d_long$value / cell_type3d_long$total_cells * 100
+cell_type3d_long$cell_type_factor = factor(cell_type3d_long$cell_type, 
+                                           levels = cell_types)
+
+```
+
+```{r plotting}
+size = 16
+level = c("10x_D29", "sci_D29", "10x_D78", "sci_D78", "10x_D185", "sci_D185")
+
+# start with the progenitors and proliferating progenitors
+ppro = cell_type3d_long %>% 
+  filter(cell_type_factor %in% c("RPC", "Proliferating_RPC",
+                                 "Astrocyte", "MG", "PAX2high_RLBP1low", 
+                                 "Lens", "Forebrain", "Neuron_nonretinal", 
+                                 "Roof_Plate")) %>%
+  ggplot(aes(fill=cell_type_factor, 
+                           y=percent_cell_type, 
+                           x=factor(tech_age, levels = level))) +
+  geom_bar(position="stack", stat="identity") +
+  theme_classic() +
+  xlab("Organoid Age") + ylab("% Cell Type") +
+  ggtitle("Non-neuronal") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0))) +
+  scale_fill_manual(limits = colors$V2, values = colors$V1) +
+  theme(legend.position = "none",
+        text = element_text(size=size),
+        axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1, vjust = ),
+        legend.title = element_blank()) +
+  guides(fill=guide_legend(nrow=2,byrow=TRUE))
+
+prgc = cell_type3d_long %>% filter(cell_type_factor %in% c("Npre", "RGCpre", "RGC", 
+                                                           "HApre", "Amacrine", 
+                                                           "Horizontal")) %>%
+  ggplot(aes(fill=cell_type_factor, 
+                           y=percent_cell_type, 
+                           x=factor(tech_age, levels = level))) +
+  geom_bar(position="stack", stat="identity") +
+  theme_classic() +
+  xlab("Organoid Age") + ylab("% Cell Type") +
+  ggtitle("RGC + H + A") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0))) +
+  scale_fill_manual(limits = colors$V2, values = colors$V1) +
+  theme(legend.position = "none",
+        text = element_text(size=size),
+        axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1, vjust = ),
+        legend.title = element_blank()) +
+  guides(fill=guide_legend(nrow=2,byrow=TRUE))
+
+
+pphoto = cell_type3d_long %>% filter(cell_type_factor %in% c("PBpre", "Cone_Blue", 
+                                                             "Cone_RG", "Rod", 
+                                                             "Unknown", "OFF_Bipolar", 
+                                                             "ON_Bipolar")) %>%
+  ggplot(aes(fill=cell_type_factor, 
+                           y=percent_cell_type, 
+                           x=factor(tech_age, levels = level))) +
+  geom_bar(position="stack", stat="identity") +
+  theme_classic() +
+  xlab("Organoid Age") + ylab("% Cell Type") +
+  ggtitle("PR + BP") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0))) +
+  scale_fill_manual(limits = colors$V2, values = colors$V1) +
+  theme(legend.position = "none",
+        text = element_text(size=size),
+        axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        legend.title = element_blank()) +
+  guides(fill=guide_legend(nrow=2,byrow=TRUE))
+
+pall = ggarrange(ppro + theme(axis.title.x = element_blank()), 
+          prgc + theme(axis.title.y = element_blank(), 
+                       axis.title.x = element_blank()), 
+          pphoto + theme(axis.title.y = element_blank(), 
+                         axis.title.x = element_blank() ), 
+          nrow = 1)
+
+save_plot("Plots/10X_3d_indiv_barplots.jpeg", pall, base_width = 10, base_height = 4.5)
+
+```
+
+# Figures S1B-E
+```{r unfiltered QC}
+
+# NOTE: this was done with an unfiltered cds that contained all of the cells
+# it can be created from the GEO metadata files and the matrix
+sci_cds = readRDS("R_objects/211007_organoid_cds_with_hash_data.RDS")
+
+```
+
+# Figure S1B
+```{r make knee plot}
+
+breaks_for_plot_x = c(1, 10, 100, 1000, 10000, 100000)
+breaks_for_plot = c(1, 10, 30, 100, 300, 1000, 3000, 10000, 100000)
+sm = 15
+med = 8
+
+# RNA knee plot
+p = sci_cds@colData %>% as.data.frame() %>%
+  dplyr::select(cell, n.umi) %>%
+  arrange(desc(n.umi)) %>%
+  mutate(rank = dplyr::row_number()) %>%
+  ggplot() +
+  geom_line(aes(x = rank,
+                y = n.umi)) +
+  #scale_x_log10(breaks = breaks_for_plot) +
+  scale_y_log10(breaks = breaks_for_plot) +
+  scale_x_continuous(expand = c(0, 0), breaks = breaks_for_plot_x, labels = scales::scientific, trans = "log10") +
+  theme_classic() +
+  geom_hline(yintercept = 1000, 
+             color = "red") +
+  geom_hline(yintercept = 100, 
+             color = "dodgerblue")+
+  theme(#axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        text = element_text(size = sm)) + 
+  xlab("Number of Cells") +
+  ylab("UMIs per Cell (RNA)")
+save_plot("Plots/sci_only_rna_kneeplot.jpeg", p, base_height = 2.5)
+
+```
+
+# Figure S1C
+```{r make histogram of n.umi}
+
+p1 = sci_cds@colData %>% as.data.frame() %>%
+  dplyr::select(cell, n.umi) %>%
+  ggplot() +
+  geom_histogram(aes(log10(n.umi)), bins = 200) +
+  scale_x_continuous(expand = c(0, 0)) + 
+  scale_y_continuous(expand = c(0,0)) +
+  monocle3:::monocle_theme_opts() +
+  theme(text = element_text(size = sm)) +
+  xlab("Number of UMIs (log10)") +
+  ylab("Number of Cells") +
+  geom_vline(xintercept = log10(1000), col = "red")
+pg = plot_grid(p, p1)
+
+save_plot("Plots/numi_qc.jpeg", pg, base_width = 7, base_height = 3.5)
+
+```
+
+# Figure S1D-E
+```{r make top ratio plot}
+
+# histogram
+umi_cds = sci_cds[, sci_cds@colData$n.umi > 1000]
+p2 = umi_cds@colData %>% as.data.frame() %>%
+  dplyr::select(cell, top_to_second_best_ratio) %>%
+  ggplot() +
+  geom_histogram(aes(log2(top_to_second_best_ratio)), bins = 200) +
+  scale_x_continuous(limits = c(0,16), expand = c(0, 0)) + scale_y_continuous(expand = c(0, 0)) +
+  monocle3:::monocle_theme_opts() +
+  theme(text = element_text(size = sm)) +
+  xlab("Top to Second Best Ratio (log2)") + ylab("Number of Cells") +
+  geom_vline(xintercept = log2(3), col = "red")
+
+# barplot
+p3 = umi_cds@colData %>% as.data.frame() %>%
+  mutate(hash_info = case_when(top_to_second_best_ratio <= 3 ~ "<= 3",
+                               (top_to_second_best_ratio > 3 & top_to_second_best_ratio < Inf) ~ "> 3",
+                               top_to_second_best_ratio == Inf ~ "infinite",
+                               is.na(top_to_second_best_ratio) ~ " no hash")) %>%
+  group_by(hash_info) %>%
+  dplyr::count() %>%
+  ggplot(aes(x = hash_info, y = n)) +
+  geom_bar(stat = "identity") +
+  monocle3:::monocle_theme_opts() +
+  theme(text = element_text(size = sm)) +
+  scale_y_continuous(expand = c(0, 0)) +
+  xlab("Top to Second Best Ratio") + ylab("Number of Cells")
+
+pg = plot_grid(p2, p3, rel_widths = c(1.5, 1))
+save_plot("Plots/sci_hash_combined.jpeg", pg, base_height = 3.5, base_width = 9)
+
+```
+
+# Figures S1F-G
+```{r plot number of umis and genes for each condition}
+
+p2 = joint_cds@colData %>% as.data.frame() %>%
+  ggplot(aes(x = tech, y = n.umi, fill = age)) +
+  geom_boxplot(notch = T, notchwidth = 0.2, outlier.size = 0.2) +
+  scale_fill_manual(values = c(D28 = "#e63946", D78 = "#fbce65", D185 = "#578ab5")) +
+  scale_y_continuous(trans='log10') + ylab("UMIs per Cell") +
+  monocle3:::monocle_theme_opts() +
+  theme(axis.title.x = element_blank(),
+        legend.position = "none")
+
+# get genes counts
+joint_cds@colData$n.genes = diff(assay(joint_cds)@p)
+
+p3 = joint_cds@colData %>% as.data.frame() %>%
+  ggplot(aes(x = tech, y = n.genes, fill = age)) +
+  geom_boxplot(notch = T, notchwidth = 0.2, outlier.size = 0.2) +
+  scale_fill_manual(values = c(D28 = "#e63946", D78 = "#fbce65", D185 = "#578ab5")) +
+  scale_y_continuous(trans='log10') + ylab("Genes per Cell") +
+  monocle3:::monocle_theme_opts() +
+  theme(axis.title.x = element_blank(),
+        legend.position = "none")
+
+
+pg = plot_grid(p1, p2, p3, rel_widths = c(1, 1.5, 1.5), scale = 0.95, nrow = 1)
+
+save_plot("Plots/combined_cell_and_umi_counts.jpeg", pg, base_height = 2.75, base_width = 9)
+  
+pg
+
+```
+
+# Figure S1H
+```{r plot the number of cells in each condition}
+
+sample_counts = joint_cds@colData %>% as.data.frame() %>% 
+    group_by(tech, age) %>%
+    dplyr::count()
+
+p1 = sample_counts %>%
+  ggplot(aes(x = factor(age, levels = c("D28", "D78", "D185")), y = n, fill = age)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~tech) +
+  monocle3:::monocle_theme_opts() +
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_fill_manual(values = c(D28 = "#e63946", D78 = "#fbce65", D185 = "#578ab5")) +
+  xlab("Organoid age") + ylab("Number of cells") +
+  theme(legend.position = "none",
+        axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 30, hjust = 1, vjust = 1))
+save_plot("Plots/combined_cell_counts.jpeg", p1, base_height = 3, base_width = 3)
+
+```
+
+# Figure S1I
+```{r integration UMAP}
+
+library(wesanderson)
+
+gg = plot_cells(joint_cds, color_cells_by = "tech", label_cell_groups = F, alpha = 0.8, cell_size = 0.2) + 
+  theme_void() +
+  theme(legend.position = c(0.9, 0.9),
+        legend.title = element_blank(),
+        text = element_text(size = 18)) +
+  scale_color_manual(values = c(wes_palette("Darjeeling2")[3], wes_palette("Darjeeling2")[2]))
+
+save_plot("Plots/combined_integration_umap.jpeg", gg, base_height = 3, base_width = 4)
+
+```
+
+# Figure S1J
+```{r feature plots}
+
+fp = plot_cells(joint_cds, genes = c("VSX2", "RAX", 
+                                     "MKI67", "TOP2A", "HES6", "ATOH7", 
+                                     "POU4F2", "ISL1",
+                                     "PRDM13", "TFAP2A", "PROX1", 
+                                     "OTX2", "ARR3", "NR2E3",
+                                     "CRX", "GRM6", "GRIK1", "GADD45B",
+                                     "RLBP1", "PAX2", "PAX6", 
+                                     "SOX1", "FOXG1", "LMX1A", "ELAVL4"),
+                cell_size = 0.1, scale_to_range = T, label_cell_groups = F) +
+  theme_void() + monocle3:::monocle_theme_opts()
+
+fp
+save_plot("Plots/combined_feature_plots.jpeg", fp, base_width = 6.5, base_height = 5)
+
+```
+
+# Figure S1K
+```{r stacked bar plots for all cell types}
+
+# get counts of cells in each cell type
+cell_type3d_df = joint_cds@colData %>% as.data.frame() %>%
+  group_by(age, tech, tech_age, cell_type) %>%
+  dplyr::count()
+
+cell_types = c("RPC", "Proliferating_RPC", "MG", "PAX2high_RLBP1low", "Lens", "Astrocyte", 
+               "Forebrain", "Neuron_nonretinal", "Roof_Plate",
+               "Npre", "RGCpre", "RGC", "HApre", "Horizontal", "Amacrine",
+               "PBpre", "Cone_Blue", "Cone_RG", "Rod",  "Unknown", "OFF_Bipolar", "ON_Bipolar")                                           
+
+gg = ggplot(cell_type3d_df, aes(fill=factor(cell_type, 
+                                       levels = cell_types), 
+                           y=n, x=factor(age, levels = c("D28", "D78", "D185")))) +
+  facet_wrap(~tech) +
+  geom_bar(position="fill", stat="identity") +
+  theme_cowplot() + monocle3:::monocle_theme_opts() +
+  xlab("Organoid Age") + ylab("% Cell Type") +
+  scale_fill_discrete(name = "Cell Type") +
+  scale_fill_manual(limits = colors$V2, values = colors$V1) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0))) +
+  theme(legend.title = element_blank(),
+        legend.text = element_text(size = 12),
+        legend.position = "right",
+        text = element_text(size = 20),
+        plot.background = element_rect(fill = "white", color = "white")) +
+  guides(fill = guide_legend(ncol = 1))
+
+gg 
+
+save_plot("Plots/combined_3d_celltype_stacked_barplot.jpeg", gg, base_height = 7.5, base_width = 10)
+
+
+```
+
+
+# load the filtered and annotated cds with just the sci data
+```{r load the filtered and annotated cds}
+
+filt3d_sci_cds = readRDS("filtered_sci_3d_220712.RDS")
+
+```
+
+```{r define colors}
+
+# OPTIONAL - remove cell types not present in this dataset
+cell_types = unique(filt3d_sci_cds$cell_type)
+colors = colors %>% filter(V1 %in% cell_types)
+colors
+
+```
+
+# Figure S1L
+```{r genes of interest}
+
+gp = plot_cells(filt3d_sci_cds, x = 1, y = 3, 
+                genes = c("VSX2", "RAX", "MKI67","TOP2A", "HES6",
+                          "ATOH7", "POU4F2", "ISL1", "PRDM13", 
+                          "TFAP2A", "PROX1", "OTX2", "ARR3", 
+                          "OPN1SW", "NR2E3", "GRM6", "GRIK1", 
+                          "ADAMTS5", "RLBP1", "PAX2", "PAX6", 
+                          "SOX1", "FOXG1", "LMX1A", "ELAVL4"), 
+           cell_size = 0.1, scale_to_range = T, label_cell_groups = F) +
+  theme_void() + monocle3:::monocle_theme_opts()
+save_plot("Plots/sci_only_3d_genes.jpeg", gp)
+
+```
+
+# Figure S1M
+```{r umap with days highlighted on the right}
+
+size = 8
+
+pc = plot_cells(filt3d_sci_cds, color_cells_by = "cell_type", cell_size = 0.5,
+                label_cell_groups = F, x = 1, y = 3) +
+  scale_color_manual(values = colors$V1, limits = colors$V2) +
+  theme_void() + theme(legend.position = "none")
+
+d30 = plot_cells(filt3d_sci_cds, color_cells_by = "age", cell_size = 0.1,
+           label_cell_groups = F, x = 1, y = 3) +
+  scale_color_manual(values = c(D28 = "#e63946", D78 = "#fbce65", D185 = "#578ab5")) +
+  gghighlight(age == "D28") +
+  theme_void() + ggtitle("Day 28") + theme(text = element_text(size = size))
+
+d78 = plot_cells(filt3d_sci_cds, color_cells_by = "age", cell_size = 0.1,
+           label_cell_groups = F, x = 1, y = 3) +
+  scale_color_manual(values = c(D28 = "#e63946", D78 = "#fbce65", D185 = "#578ab5")) +
+  gghighlight(age == "D78") +
+  theme_void() + ggtitle("Day 78") + theme(text = element_text(size = size))
+
+d180 = plot_cells(filt3d_sci_cds, color_cells_by = "age", cell_size = 0.1,
+           label_cell_groups = F, x = 1, y = 3) +
+  scale_color_manual(values = c(D28 = "#e63946", D78 = "#fbce65", D185 = "#578ab5")) +
+  gghighlight(age == "D185") +
+  theme_void() + ggtitle("Day 185") + theme(text = element_text(size = size))
+
+pg = plot_grid(d30, d78, d180, ncol = 1)
+
+pg2 = plot_grid(pc, pg, rel_widths = c(3, 1))
+
+save_plot(pg2, filename = "Plots/sci_3d_celltypes_ages.jpeg")
+
+```
+
+# Figure S1N
+```{r % calculations needed for plotting only some of the cell types in bar plots}
+
+# get counts of cells in each cell type
+cell_type3d_df = filt3d_sci_cds@colData %>% as.data.frame() %>%
+  group_by(age, cell_type) %>%
+  dplyr::count()
+
+cell_type3d_wide = pivot_wider(cell_type3d_df, names_from = cell_type, values_from = n)
+
+cell_type3d_wide = cell_type3d_wide %>% remove_rownames %>% column_to_rownames(var="age")
+cell_type3d_wide[is.na(cell_type3d_wide)] = 0
+cell_type3d_wide$total_cells = rowSums(cell_type3d_wide)
+cell_type3d_wide$age = rownames(cell_type3d_wide)
+
+cell_type3d_long = pivot_longer(cell_type3d_wide, names_to = "cell_type",
+                                cols = c("RPC", "Proliferating_RPC", "MG","Lens", "Astrocyte",
+                                                  "Forebrain", "Neuron_nonretinal", "Roof_Plate", "Npre", "RGCpre",
+                                                  "RGC", "HApre", "Amacrine", "Horizontal",
+                                                  "PBpre", "Cone_RG", "Cone_Blue", "Rod", "Unknown",
+                                                  "OFF_Bipolar", "ON_Bipolar"))
+
+cell_type3d_long$percent_cell_type = cell_type3d_long$value / cell_type3d_long$total_cells * 100
+cell_type3d_long$cell_type_factor = factor(cell_type3d_long$cell_type, 
+                                           levels = c("RPC", "Proliferating_RPC", "MG","Lens", "Astrocyte",
+                                                  "Forebrain", "Neuron_nonretinal", "Roof_Plate", "Npre", "RGCpre",
+                                                  "RGC", "HApre", "Amacrine", "Horizontal",
+                                                  "PBpre", "Cone_RG", "Cone_Blue", "Rod", "Unknown",
+                                                  "OFF_Bipolar", "ON_Bipolar"))
+
+cell_type3d_long
+
+```
+
+
+```{r make the cell group specific bar plots}
+size = 12
+
+# start with the progenitors and proliferating progenitors
+ppro = cell_type3d_long %>% filter(cell_type_factor %in% c("RPC", "Proliferating_RPC", "MG","Lens",
+                                                           "Astrocyte", "Forebrain",
+                                                           "Neuron_nonretinal", "Roof_Plate")) %>%
+  ggplot(aes(fill=cell_type_factor, 
+                           y=percent_cell_type, 
+                           x=factor(age, levels = c("D28", "D78", "D185")))) +
+  geom_bar(position="stack", stat="identity") +
+  theme_classic() +
+  xlab("Organoid Age") + ylab("% Cell Type") +
+  ggtitle("Non-neuronal") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0))) +
+  scale_fill_discrete(name = "Cell Type") +
+  scale_fill_manual(values = colors$V1, limits = colors$V2) +
+  theme(legend.position = "none",
+        plot.title = element_text(size=size),
+        axis.title.x = element_blank(),
+        legend.title = element_blank()) +
+  guides(fill=guide_legend(nrow=2,byrow=TRUE))
+
+prgc = cell_type3d_long %>% filter(cell_type_factor %in% c("Npre", "RGCpre", "RGC", 
+                                                           "HApre", "Amacrine", 
+                                                           "Horizontal")) %>%
+  ggplot(aes(fill=cell_type_factor, 
+                           y=percent_cell_type, 
+                           x=factor(age, levels = c("D28", "D78", "D185")))) +
+  geom_bar(position="stack", stat="identity") +
+  theme_classic() +
+  xlab("Organoid Age") + ylab("% Cell Type") +
+  ggtitle("RGC + Horizontal + Amacrine") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0))) +
+  scale_fill_discrete(name = "Cell Type") +
+  scale_fill_manual(values = colors$V1, limits = colors$V2) +
+  theme(legend.position = "none",
+        plot.title = element_text(size=size),
+        axis.title.x = element_blank(),
+        legend.title = element_blank()) +
+  guides(fill=guide_legend(nrow=2,byrow=TRUE))
+
+
+pphoto = cell_type3d_long %>% filter(cell_type_factor %in% c("PBpre", "Cone_RG", "Cone_Blue", 
+                                                             "Rod", "Unknown","OFF_Bipolar",
+                                                             "ON_Bipolar")) %>%
+  ggplot(aes(fill=cell_type_factor, 
+                           y=percent_cell_type, 
+                           x=factor(age, levels = c("D28", "D78", "D185")))) +
+  geom_bar(position="stack", stat="identity") +
+  theme_classic() +
+  xlab("Organoid Age") + ylab("% Cell Type") +
+  ggtitle("Photoreceptor + Bipolar") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0))) +
+  scale_fill_discrete(name = "Cell Type") +
+  scale_fill_manual(values = colors$V1, limits = colors$V2) +
+  theme(legend.position = "none",
+        plot.title = element_text(size=size),
+        axis.title.x = element_blank(),
+        legend.title = element_blank()) +
+  guides(fill=guide_legend(nrow=2,byrow=TRUE))
+
+pall = ggarrange(ppro + theme(axis.title.x = element_blank()), 
+          prgc + theme(axis.title.y = element_blank(), axis.title.x = element_blank()), 
+          pphoto + theme(axis.title.y = element_blank(), axis.title.x = element_blank() ), 
+          ncol = 3)
+
+
+save_plot("Plots/sci_3d_indiv_barplots.jpeg", pall, base_width = 7.5, base_height = 3)
+
+```
+
+
+
+
+
+
+
